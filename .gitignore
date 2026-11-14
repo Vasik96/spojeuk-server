@@ -1,0 +1,16 @@
+# build
+/target
+
+# lokální stav serveru (STATE_FILE=./state.json)
+state.json
+*.tmp
+
+# tajemství a lokální nastavení
+.env
+.env.*
+
+# editor / systém
+.idea/
+.vscode/
+*.swp
+.DS_Store

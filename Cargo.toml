@@ -1,0 +1,18 @@
+[package]
+name = "spoje-feed"
+version = "0.3.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tiny_http = "0.12"
+ureq = { version = "2.10", default-features = false, features = ["native-tls"] }
+native-tls = "0.2"
+ctrlc = { version = "3", features = ["termination"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

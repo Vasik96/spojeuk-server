@@ -161,14 +161,14 @@ pub fn http_get(url: &str, timeout: Duration) -> Result<(u16, Vec<u8>), String> 
 pub fn sjtsk_to_wgs84(east: f64, north: f64) -> Option<(f64, f64)> {
     use std::f64::consts::PI;
     let a = 6377397.155_f64;
-    let f = 1.0 / 299.1528128;
+    let f: f64 = 1.0 / 299.1528128;
     let e2 = 2.0 * f - f * f;
     let e = e2.sqrt();
     let phi_c = 49.5_f64.to_radians();
     let lambda_0 = (24.0 + 50.0 / 60.0_f64).to_radians();
     let alpha_c = (30.0 + 17.0 / 60.0 + 17.3031 / 3600.0_f64).to_radians();
     let phi_p = 78.5_f64.to_radians();
-    let k_p = 0.9999;
+    let k_p: f64 = 0.9999;
     let a_ = (a * (1.0 - e2).sqrt()) / (1.0 - e2 * phi_c.sin().powi(2));
     let b = (1.0 + (e2 * phi_c.cos().powi(4)) / (1.0 - e2)).sqrt();
     let gamma_0 = (phi_c.sin() / b).asin();

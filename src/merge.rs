@@ -34,6 +34,10 @@ pub struct Vehicle {
     pub ac: Option<bool>,
     pub heading: Option<f64>,
     pub city: bool,
+    /// DPMÚL: číslo aktuální a konečné stanice (pomáhá appce přiřadit vůz ke spoji)
+    pub station: i64,
+    #[serde(rename = "finalStation")]
+    pub final_station: i64,
     pub sources: Vec<String>,
     pub ids: Vec<String>,
     pub uid: String,
@@ -498,6 +502,8 @@ pub fn parse_dpmul(arr: &[Value], now_ms: i64, stations: &mut HashMap<i64, (f64,
             ac: opt_bool(o.get("isAirConditioned")),
             heading,
             city: true,
+            station,
+            final_station: num_or0(o.get("finalStationNumber")) as i64,
             ..Default::default()
         });
     }
@@ -588,6 +594,12 @@ fn resolve(group: Vec<Vehicle>) -> Vehicle {
     let low = pick_opt!(group, wi, low);
     let ac = pick_opt!(group, wi, ac);
     let heading = pick_opt!(group, wi, heading);
+    let station = if group[wi].station != 0 { group[wi].station } else { group.iter().map(|v| v.station).find(|s| *s != 0).unwrap_or(0) };
+    let final_station = if group[wi].final_station != 0 {
+        group[wi].final_station
+    } else {
+        group.iter().map(|v| v.final_station).find(|s| *s != 0).unwrap_or(0)
+    };
     let train = group.iter().any(|v| v.train);
     let sources: Vec<String> = group.iter().map(|v| v.source.clone()).collect();
     let ids: Vec<String> = group.iter().filter(|v| v.id != 0).map(|v| format!("{}:{}", v.source, v.id)).collect();
@@ -599,6 +611,8 @@ fn resolve(group: Vec<Vehicle>) -> Vehicle {
     w.low = low;
     w.ac = ac;
     w.heading = heading;
+    w.station = station;
+    w.final_station = final_station;
     w.sources = sources;
     w.ids = ids;
     w

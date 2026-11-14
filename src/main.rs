@@ -15,9 +15,14 @@
 //!   GET /api/vehicles                                  všechna vozidla sloučená ze zdrojů (nejčerstvější poloha)
 //!   GET /api/raw/duk | /api/raw/dpmul | /api/raw/sz    jednotlivé zdroje tak, jak jsou
 //!   GET /api/health                                    totéž co /health
+//!
+//! Rate limiting: kyblík žetonů na IP klienta (viz ratelimit.rs). Výchozí RATE_PER_MIN=30 a RATE_BURST=10:
+//! appka s dotazem každých 5–10 s se k limitu nedostane a rezerva pokryje i dotazy mimo rozvrh
+//! (start, návrat z pozadí, appka bez zdroje dat si řekne hned). /health se neomezuje. Nad limit = 429 + Retry-After.
 //! Bez async runtime: pár vláken, blokující I/O.
 
 mod merge;
+mod ratelimit;
 mod sz;
 
 use std::{
@@ -26,12 +31,14 @@ use std::{
     io::{Cursor, Read},
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, MutexGuard},
+    net::IpAddr,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use ratelimit::{client_ip, ip_key, RateLimiter, Verdict};
 use merge::{SourceInput, Vehicle};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
@@ -61,6 +68,13 @@ struct Config {
     sz_url: String,
     sz_poll_s: f64,
     sz_hold_s: f64,
+    /// 0 = bez omezení
+    rate_per_min: f64,
+    rate_burst: f64,
+    /// kolik proxy stojí před serverem (X-Forwarded-For); výchozí 1 při bind na loopback (typicky Caddy/nginx)
+    trust_proxy: usize,
+    /// IP bez omezení (čárkou oddělené), např. vlastní webový server
+    rate_exempt: Vec<IpAddr>,
 }
 
 fn env_str(k: &str, d: &str) -> String {
@@ -70,14 +84,19 @@ fn env_f(k: &str, d: f64) -> f64 {
     env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d)
 }
 
+fn is_loopback_bind(b: &str) -> bool {
+    b == "localhost" || b.parse::<IpAddr>().map_or(false, |ip| ip.is_loopback())
+}
+
 impl Config {
     fn from_env() -> Self {
+        let bind = env_str("BIND", "127.0.0.1");
         Config {
             upstream: env_str("UPSTREAM_URL", "https://tabule.portabo.cz/api/v1-tabule/cis/GetTraffic/0"),
             poll_s: env_f("POLL_S", 10.0),
             hold_mhd_s: env_f("HOLD_MHD_S", 300.0),
             hold_other_s: env_f("HOLD_OTHER_S", 180.0),
-            bind: env_str("BIND", "127.0.0.1"),
+            bind: bind.clone(),
             port: env_f("PORT", 8787.0) as u16,
             state_file: PathBuf::from(env_str("STATE_FILE", "/var/lib/spoje-feed/state.json")),
             dpmul_url: env_str(
@@ -97,6 +116,13 @@ impl Config {
             // SŽ banuje IP, které na ně pouští služby: nikdy rychleji než jednou za 10 s
             sz_poll_s: env_f("SZ_POLL_S", 10.5).max(10.0),
             sz_hold_s: env_f("SZ_HOLD_S", 120.0),
+            rate_per_min: env_f("RATE_PER_MIN", 30.0).max(0.0),
+            rate_burst: env_f("RATE_BURST", 10.0).max(1.0),
+            trust_proxy: env_f("TRUST_PROXY", if is_loopback_bind(&bind) { 1.0 } else { 0.0 }).max(0.0) as usize,
+            rate_exempt: env_str("RATE_EXEMPT", "")
+                .split(',')
+                .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+                .collect(),
         }
     }
 
@@ -181,6 +207,7 @@ struct Shared {
     dpmul: Mutex<Dpmul>,
     sz: Mutex<Sz>,
     vcache: Mutex<(f64, Arc<[u8]>)>, // sestavený /api/vehicles a kdy
+    limiter: Option<RateLimiter>,
     stop: Stop,
     start: Instant,
 }
@@ -684,8 +711,37 @@ fn health(sh: &Shared) -> Arc<[u8]> {
     // SŽ se do souhrnného "ok" nepočítá: její 403 nesmí shodit zdraví celého serveru
     let body = json!({"ok": duk_ok && dpmul_ok,
                       "uptimeMs": sh.start.elapsed().as_millis() as u64,
-                      "duk": duk, "dpmul": dpmul, "sz": sz});
+                      "duk": duk, "dpmul": dpmul, "sz": sz,
+                      "rateLimit": {"enabled": sh.limiter.is_some(), "perMin": sh.cfg.rate_per_min,
+                                    "burst": sh.cfg.rate_burst,
+                                    "limitedTotal": sh.limiter.as_ref().map_or(0, |l| l.limited_total())}});
     Arc::from(serde_json::to_vec(&body).unwrap_or_default())
+}
+
+/// Některé = klient překročil limit (hodnota je Retry-After v sekundách).
+fn rate_limited(rq: &tiny_http::Request, sh: &Shared) -> Option<u64> {
+    let limiter = sh.limiter.as_ref()?;
+    let xff = rq
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("X-Forwarded-For"))
+        .map(|h| h.value.as_str().to_string());
+    let ip = client_ip(rq.remote_addr().map(|a| a.ip()), xff.as_deref(), sh.cfg.trust_proxy);
+    let key = match ip {
+        Some(ip) if sh.cfg.rate_exempt.contains(&ip) => return None,
+        Some(ip) => ip_key(ip),
+        None => "unknown".to_string(),
+    };
+    match limiter.take(&key) {
+        Verdict::Ok => None,
+        Verdict::Limited { retry_after_s } => {
+            let n = limiter.limited_total();
+            if n == 1 || n % 200 == 0 {
+                warn!("rate limit: {} překročil limit (celkem {} zamítnutých)", key, n);
+            }
+            Some(retry_after_s)
+        }
+    }
 }
 
 fn handle(rq: tiny_http::Request, sh: &Shared) {
@@ -694,6 +750,26 @@ fn handle(rq: tiny_http::Request, sh: &Shared) {
         return;
     }
     let path = rq.url().split('?').next().unwrap_or("").to_string();
+    // /health se neomezuje (monitoring); všechno ostatní včetně 404 ano
+    if path != "/health" && path != "/api/health" {
+        if let Some(retry) = rate_limited(&rq, sh) {
+            let body = json!({"error": "rate_limited", "retryAfterSec": retry}).to_string().into_bytes();
+            let len = body.len();
+            let resp = Response::new(
+                StatusCode(429),
+                vec![
+                    hdr("Content-Type", "application/json; charset=utf-8"),
+                    hdr("Retry-After", &retry.to_string()),
+                    hdr("Cache-Control", "no-store"),
+                ],
+                Cursor::new(body),
+                Some(len),
+                None,
+            );
+            let _ = rq.respond(resp);
+            return;
+        }
+    }
     let mut x_age: Option<i64> = None;
     let body: Arc<[u8]> = match path.as_str() {
         "/duk/traffic" => lock(&sh.duk).payload.clone(),
@@ -801,6 +877,7 @@ fn main() {
             last_request: 0.0,
         }),
         vcache: Mutex::new((0.0, Arc::from(&b""[..]))),
+        limiter: (cfg.rate_per_min > 0.0).then(|| RateLimiter::new(cfg.rate_per_min, cfg.rate_burst)),
         stop: Stop { m: Mutex::new(false), cv: Condvar::new() },
         start: Instant::now(),
     });
@@ -830,6 +907,11 @@ fn main() {
             std::process::exit(1);
         }),
     );
+    if cfg.rate_per_min > 0.0 {
+        info!("rate limit: {}/min na klienta, rezerva {}, proxy {}, výjimky {}", cfg.rate_per_min, cfg.rate_burst, cfg.trust_proxy, cfg.rate_exempt.len());
+    } else {
+        info!("rate limit vypnut (RATE_PER_MIN=0)");
+    }
     info!("poslouchám na {}:{}, upstream DÚK {}, DPMÚL {}, SŽ {}", cfg.bind, cfg.port, cfg.upstream, cfg.dpmul_url, if cfg.sz_enabled { "zapnuta" } else { "vypnuta" });
 
     let workers: Vec<_> = (0..HTTP_WORKERS)

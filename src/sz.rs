@@ -221,12 +221,7 @@ pub fn sjtsk_to_wgs84(east: f64, north: f64) -> Option<(f64, f64)> {
     }
 }
 
-/// Jen Ústecký kraj, Praha a okolí: stejný rámec jako inUsteckyKraj() v MapScreen.kt.
-pub fn in_sz_box(lat: f64, lng: f64) -> bool {
-    (49.90..=51.10).contains(&lat) && (12.80..=14.80).contains(&lng)
-}
-
-/// Odpověď SŽ ({"result":[...]}) → vlaky v rámci SZ_BOX.
+/// Odpověď SŽ ({"result":[...]}) → všechny vlaky.
 pub fn parse_sz(data: &Value) -> Vec<Vehicle> {
     let mut out = Vec::new();
     let Some(arr) = data.get("result").and_then(|r| r.as_array()) else { return out };
@@ -240,9 +235,6 @@ pub fn parse_sz(data: &Value) -> Vec<Vehicle> {
             continue;
         }
         let Some((lat, lng)) = sjtsk_to_wgs84(js_number(c.first()), js_number(c.get(1))) else { continue };
-        if !in_sz_box(lat, lng) {
-            continue;
-        }
         let cat = str_or_empty(p.get("tt")).trim().to_string();
         let num = str_or_empty(p.get("tn")).trim().to_string();
         let parsed_id = js_parse_int(Some(&Value::String(num.clone())));

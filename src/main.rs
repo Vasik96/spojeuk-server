@@ -9,11 +9,18 @@
 //!
 //! SŽ (Správa železnic): vlaky z mapy SŽ (bez User-Agent, min. 10 s mezi dotazy, 403 = dlouhá pauza).
 //!
+//! DPMD (Dopravní podnik města Děčína): městské autobusy z mapy doprava.dpmdas.cz (TrafficState.js, JavaScript
+//! místo JSONu, čte ho jsl.rs; gzip se rozbaluje v inflate.rs). DÚK Děčín nezná, tak se bere přímo od dopravce.
+//!
+//! PID (Golemio): všechny druhy dopravy PID včetně vlaků v oblasti PID. Zapíná se klíčem GOLEMIO_API_KEY (bez něj se
+//! kanál nedotazuje). Vlaky PID se sloučí s vlaky SŽ (a DÚK) podle čísla vlaku, viz pid.rs a merge.rs.
+//!
 //! Endpointy:
 //!   GET /duk/traffic, /dpmul/traffic, /health          původní (zůstávají kvůli Android appce a webu)
 //!   GET /api/                                          přehled API v2
 //!   GET /api/vehicles                                  všechna vozidla sloučená ze zdrojů (nejčerstvější poloha)
-//!   GET /api/raw/duk | /api/raw/dpmul | /api/raw/sz    jednotlivé zdroje tak, jak jsou
+//!   GET /api/raw/duk | /api/raw/dpmul | /api/raw/sz | /api/raw/dpmd   jednotlivé zdroje tak, jak jsou
+//!   GET /api/raw/pid                                   PID: už rozebraná vozidla (Golemio je velké, surové se nedrží)
 //!   GET /api/health                                    totéž co /health
 //!
 //! Rate limiting: kyblík žetonů na IP klienta (viz ratelimit.rs). Výchozí RATE_PER_MIN=30 a RATE_BURST=10:
@@ -21,7 +28,11 @@
 //! (start, návrat z pozadí, appka bez zdroje dat si řekne hned). /health se neomezuje. Nad limit = 429 + Retry-After.
 //! Bez async runtime: pár vláken, blokující I/O.
 
+mod dpmd;
+mod inflate;
+mod jsl;
 mod merge;
+mod pid;
 mod ratelimit;
 mod sz;
 
@@ -68,6 +79,16 @@ struct Config {
     sz_url: String,
     sz_poll_s: f64,
     sz_hold_s: f64,
+    dpmd_enabled: bool,
+    dpmd_url: String,
+    dpmd_poll_s: f64,
+    dpmd_hold_s: f64,
+    pid_enabled: bool,
+    pid_url: String,
+    /// tajemství: nikdy se nelogguje ani nevypisuje
+    pid_key: String,
+    pid_poll_s: f64,
+    pid_hold_s: f64,
     /// 0 = bez omezení
     rate_per_min: f64,
     rate_burst: f64,
@@ -116,6 +137,17 @@ impl Config {
             // SŽ banuje IP, které na ně pouští služby: nikdy rychleji než jednou za 10 s
             sz_poll_s: env_f("SZ_POLL_S", 10.5).max(10.0),
             sz_hold_s: env_f("SZ_HOLD_S", 120.0),
+            dpmd_enabled: env_str("DPMD", "1") != "0",
+            dpmd_url: env_str("DPMD_URL", "https://tabla.dpmdas.cz/data/TrafficState.js"),
+            // soubor se u DPMD generuje po 5 s; 10 s stačí (po gzipu ~35 KB na dotaz)
+            dpmd_poll_s: env_f("DPMD_POLL_S", 10.0).max(5.0),
+            dpmd_hold_s: env_f("DPMD_HOLD_S", 120.0),
+            pid_key: env_str("GOLEMIO_API_KEY", "").trim().to_string(),
+            pid_enabled: env_str("PID", "1") != "0" && !env_str("GOLEMIO_API_KEY", "").trim().is_empty(),
+            pid_url: env_str("PID_URL", "https://api.golemio.cz/v2/vehiclepositions?limit=10000&includeNotTracking=true"),
+            // limit Golemio je 20 dotazů za 8 s na klíč, odpověď se cachuje 5 s
+            pid_poll_s: env_f("PID_POLL_S", 10.0).max(5.0),
+            pid_hold_s: env_f("PID_HOLD_S", 120.0),
             rate_per_min: env_f("RATE_PER_MIN", 30.0).max(0.0),
             rate_burst: env_f("RATE_BURST", 10.0).max(1.0),
             trust_proxy: env_f("TRUST_PROXY", if is_loopback_bind(&bind) { 1.0 } else { 0.0 }).max(0.0) as usize,
@@ -180,6 +212,29 @@ struct Sz {
     last_request: f64,
 }
 
+struct Dpmd {
+    payload: Arc<[u8]>, // /api/raw/dpmd (JSON)
+    list: Vec<Vehicle>,
+    list_ts: f64,
+    last_ok: f64,
+    failures: u64,
+    last_error: String,
+    vehicles: usize, // ve službě
+    last_fetch_ms: u64,
+}
+
+struct Pid {
+    list: Vec<Vehicle>,
+    list_ts: f64,
+    last_ok: f64,
+    failures: u64,
+    last_error: String,
+    vehicles: usize,
+    features: usize,
+    blocked_until: f64,
+    last_fetch_ms: u64,
+}
+
 struct Stop {
     m: Mutex<bool>,
     cv: Condvar,
@@ -206,6 +261,8 @@ struct Shared {
     duk: Mutex<Duk>,
     dpmul: Mutex<Dpmul>,
     sz: Mutex<Sz>,
+    dpmd: Mutex<Dpmd>,
+    pid: Mutex<Pid>,
     vcache: Mutex<(f64, Arc<[u8]>)>, // sestavený /api/vehicles a kdy
     limiter: Option<RateLimiter>,
     stop: Stop,
@@ -566,12 +623,183 @@ fn sz_body(sh: &Shared) -> (Arc<[u8]>, Option<f64>) {
     (if age <= sh.cfg.sz_hold_s { body } else { empty }, Some(age))
 }
 
+// ---------------------------------------------------------------- DPMD (Děčín)
+
+const DPMD_EMPTY: &[u8] = b"{\"TimeStamp\":null,\"buspositions\":[]}";
+
+fn dpmd_fetch(agent: &ureq::Agent, cfg: &Config) -> Result<String, String> {
+    // v = cache buster: bez něj openresty vrací kopii starou i 5 minut
+    let url = format!("{}?v={}", cfg.dpmd_url, (now() * 1000.0) as u64);
+    let resp = agent
+        .get(&url)
+        .set("User-Agent", UA)
+        .set("Accept-Encoding", "gzip")
+        .call()
+        .map_err(|e| e.to_string())?;
+    let gz = resp.header("Content-Encoding").map_or(false, |v| v.to_ascii_lowercase().contains("gzip"));
+    let body = read_body(resp)?;
+    let body = if gz || body.starts_with(&[0x1f, 0x8b]) { inflate::gunzip(&body, 16 << 20)? } else { body };
+    String::from_utf8(body).map_err(|e| e.to_string())
+}
+
+fn dpmd_poller(sh: Arc<Shared>) {
+    let cfg = sh.cfg;
+    let agent = make_agent(Duration::from_secs(15), 3);
+    while !sh.stop.is_set() {
+        let t0 = now();
+        let res = dpmd_fetch(&agent, cfg).and_then(|src| {
+            let snap = dpmd::parse(&src, (now() * 1000.0) as i64)?;
+            // useknutý nebo cachovaný soubor: TimeStamp starší než 90 s se nebere
+            if let Some(st) = snap.stamp_ms {
+                let age = (now() * 1000.0) as i64 / 1000 - st / 1000;
+                if age > 90 {
+                    return Err(format!("zastaralá odpověď (TimeStamp {} s)", age));
+                }
+            }
+            Ok(snap)
+        });
+        match res {
+            Ok(snap) => {
+                let t = now();
+                let mut g = lock(&sh.dpmd);
+                g.vehicles = snap.in_service;
+                g.list = snap.vehicles;
+                g.payload = Arc::from(snap.raw);
+                g.list_ts = t;
+                g.last_ok = t;
+                g.failures = 0;
+                g.last_error.clear();
+                g.last_fetch_ms = ((t - t0) * 1000.0) as u64;
+            }
+            Err(e) => {
+                let mut g = lock(&sh.dpmd);
+                g.failures += 1;
+                g.last_error = e.clone();
+                let n = g.failures;
+                if n == 1 || n == 6 || n % 60 == 0 {
+                    warn!("DPMD selhal ({}x): {}", n, e);
+                }
+            }
+        }
+        if sh.stop.wait(Duration::from_secs_f64((cfg.dpmd_poll_s - (now() - t0)).max(0.0))) {
+            break;
+        }
+    }
+}
+
+/// Poslední odpověď DPMD (JSON bez řidičů) a její stáří; starší než DPMD_HOLD_S (nebo vypnuté / ještě žádná) = prázdná.
+fn dpmd_body(sh: &Shared) -> (Arc<[u8]>, Option<f64>) {
+    let empty: Arc<[u8]> = Arc::from(DPMD_EMPTY);
+    if !sh.cfg.dpmd_enabled {
+        return (empty, None);
+    }
+    let (last, body) = {
+        let g = lock(&sh.dpmd);
+        (g.last_ok, g.payload.clone())
+    };
+    if last == 0.0 {
+        return (empty, None);
+    }
+    let age = now() - last;
+    (if age <= sh.cfg.dpmd_hold_s { body } else { empty }, Some(age))
+}
+
+// ---------------------------------------------------------------- PID (Golemio)
+
+/// Chyba s HTTP stavem (je-li), aby se 401/403/429 dalo odlišit od výpadku sítě.
+type PidErr = (Option<u16>, String);
+
+fn pid_fetch(agent: &ureq::Agent, cfg: &Config) -> Result<Value, PidErr> {
+    let resp = agent
+        .get(&cfg.pid_url)
+        .set("X-Access-Token", &cfg.pid_key)
+        .set("Accept", "application/json")
+        .set("Accept-Encoding", "gzip")
+        .set("User-Agent", UA)
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::Status(c, _) => (Some(c), format!("HTTP {c}")),
+            e => (None, e.to_string()),
+        })?;
+    let gz = resp.header("Content-Encoding").map_or(false, |v| v.to_ascii_lowercase().contains("gzip"));
+    let body = read_body(resp).map_err(|e| (None, e))?;
+    let body = if gz || body.starts_with(&[0x1f, 0x8b]) { inflate::gunzip(&body, 128 << 20).map_err(|e| (None, e))? } else { body };
+    serde_json::from_slice(&body).map_err(|e| (None, e.to_string()))
+}
+
+fn pid_poller(sh: Arc<Shared>) {
+    let cfg = sh.cfg;
+    let agent = make_agent(Duration::from_secs(30), 0);
+    while !sh.stop.is_set() {
+        let t0 = now();
+        let blocked = lock(&sh.pid).blocked_until > t0;
+        if !blocked {
+            let res = pid_fetch(&agent, cfg).map(|data| {
+                let features = data.get("features").and_then(|f| f.as_array()).map_or(0, |a| a.len());
+                (pid::parse(&data, (now() * 1000.0) as i64), features)
+            });
+            let t = now();
+            let mut g = lock(&sh.pid);
+            match res {
+                Ok((list, features)) => {
+                    g.vehicles = list.len();
+                    g.features = features;
+                    g.list = list;
+                    g.list_ts = t;
+                    g.last_ok = t;
+                    g.failures = 0;
+                    g.last_error.clear();
+                    g.last_fetch_ms = ((t - t0) * 1000.0) as u64;
+                }
+                Err((status, e)) => {
+                    g.failures += 1;
+                    // špatný klíč / překročený limit: nebušit, počkat
+                    let pause = match status {
+                        Some(401) | Some(403) => 300.0,
+                        Some(429) => 30.0,
+                        _ => 0.0,
+                    };
+                    if pause > 0.0 {
+                        g.blocked_until = t + pause;
+                    }
+                    g.last_error = e.clone();
+                    let n = g.failures;
+                    if n == 1 || n == 6 || n % 60 == 0 {
+                        warn!("PID selhal ({}x): {}{}", n, e, if pause > 0.0 { format!(", pauza {} s", pause as i64) } else { String::new() });
+                    }
+                }
+            }
+        }
+        if sh.stop.wait(Duration::from_secs_f64((cfg.pid_poll_s - (now() - t0)).max(0.0))) {
+            break;
+        }
+    }
+}
+
+/// /api/raw/pid: poslední rozebraná vozidla a stáří; starší než PID_HOLD_S (nebo vypnuté / ještě žádná) = prázdná.
+fn pid_body(sh: &Shared) -> (Arc<[u8]>, Option<f64>) {
+    let empty: Arc<[u8]> = Arc::from(&b"{\"vehicles\":[]}"[..]);
+    if !sh.cfg.pid_enabled {
+        return (empty, None);
+    }
+    let g = lock(&sh.pid);
+    if g.last_ok == 0.0 {
+        return (empty, None);
+    }
+    let age = now() - g.last_ok;
+    if age > sh.cfg.pid_hold_s {
+        return (empty, Some(age));
+    }
+    let body = serde_json::to_vec(&json!({"vehicles": &g.list})).map(Arc::from).unwrap_or(empty);
+    (body, Some(age))
+}
+
 // ---------------------------------------------------------------- sloučená vozidla (/api/vehicles)
 
 fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
     let cfg = sh.cfg;
     let t = now();
-    let mut inputs: Vec<SourceInput> = Vec::with_capacity(3);
+    let mut inputs: Vec<SourceInput> = Vec::with_capacity(5);
 
     // DPMÚL: poslední odpověď se při výpadku drží nejvýš 60 s (stáří poloh roste)
     {
@@ -587,6 +815,30 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
             name: "DPMÚL",
             priority: 0,
             segments: &["city"],
+            health: merge::health_of(g.last_ok, t, 60.0),
+            stale_vehicle_sec: 90,
+            vehicles,
+            held: 0,
+            failures: g.failures,
+            last_error: g.last_error.clone(),
+        });
+    }
+
+    // DPMD (Děčín): vlastní číslování a žádný jiný zdroj tu nejezdí. Priorita 0, aby je nikdy nezahodilo
+    // pravidlo o "duších", a prázdné segments, aby zase nemaskovaly zastaralé vozy ostatních zdrojů.
+    if cfg.dpmd_enabled {
+        let g = lock(&sh.dpmd);
+        let held_s = (t - g.list_ts).floor() as i64;
+        let vehicles: Vec<Vehicle> = if g.list_ts > 0.0 && held_s <= 60 {
+            g.list.iter().map(|v| Vehicle { age_sec: v.age_sec + held_s, ..v.clone() }).collect()
+        } else {
+            Vec::new()
+        };
+        inputs.push(SourceInput {
+            id: "dpmd",
+            name: "DPMD",
+            priority: 0,
+            segments: &[],
             health: merge::health_of(g.last_ok, t, 60.0),
             stale_vehicle_sec: 90,
             vehicles,
@@ -633,6 +885,30 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
         (outage, g.last_ok)
     };
 
+    // PID (Golemio): pořadí poloh DÚK, PID, SŽ. Nepokrývá žádný segment (segments prázdné), takže nezahazuje
+    // zastaralé vozy jiných zdrojů; jeho vlastní osamělé zastaralé vozy (regionální autobusy, vlaky) zahodí živé DÚK.
+    if cfg.pid_enabled {
+        let g = lock(&sh.pid);
+        let held_s = (t - g.list_ts).floor() as i64;
+        let vehicles: Vec<Vehicle> = if g.list_ts > 0.0 && held_s <= 60 {
+            g.list.iter().map(|v| Vehicle { age_sec: v.age_sec + held_s, ..v.clone() }).collect()
+        } else {
+            Vec::new()
+        };
+        inputs.push(SourceInput {
+            id: "pid",
+            name: "PID (Golemio)",
+            priority: 2,
+            segments: &[],
+            health: merge::health_of(g.last_ok, t, 40.0),
+            stale_vehicle_sec: 90,
+            vehicles,
+            held: 0,
+            failures: g.failures,
+            last_error: g.last_error.clone(),
+        });
+    }
+
     // SŽ: při pauze / výpadku se poslední data drží jen 2 minuty
     if cfg.sz_enabled {
         let g = lock(&sh.sz);
@@ -645,7 +921,7 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
         inputs.push(SourceInput {
             id: "train",
             name: "Správa železnic",
-            priority: 2,
+            priority: 3,
             segments: &["regional"],
             health: merge::health_of(g.last_ok, t, 40.0),
             stale_vehicle_sec: 40,
@@ -708,10 +984,27 @@ fn health(sh: &Shared) -> Arc<[u8]> {
                "vehicles": g.vehicles, "blockedForSec": (g.blocked_until - t).max(0.0) as i64,
                "ok": ok(a), "upstreamAgeSec": a.map(|a| a as i64)})
     };
+    let dpmd = {
+        let g = lock(&sh.dpmd);
+        let a = age(g.last_ok);
+        json!({"enabled": sh.cfg.dpmd_enabled, "lastOk": g.last_ok, "failures": g.failures, "lastError": g.last_error,
+               "vehicles": g.vehicles, "lastFetchMs": g.last_fetch_ms,
+               "ok": ok(a), "upstreamAgeSec": a.map(|a| a as i64)})
+    };
+    let pid = {
+        let g = lock(&sh.pid);
+        let a = age(g.last_ok);
+        json!({"enabled": sh.cfg.pid_enabled, "configured": !sh.cfg.pid_key.is_empty(), "lastOk": g.last_ok,
+               "failures": g.failures, "lastError": g.last_error, "vehicles": g.vehicles, "features": g.features,
+               "blockedForSec": (g.blocked_until - t).max(0.0) as i64, "lastFetchMs": g.last_fetch_ms,
+               "ok": ok(a), "upstreamAgeSec": a.map(|a| a as i64)})
+    };
+    // PID se do souhrnného "ok" nepočítá (jako SŽ a DPMD)
+    // DPMD se do souhrnného "ok" nepočítá stejně jako SŽ (jeho výpadek nesmí shodit zdraví celého serveru)
     // SŽ se do souhrnného "ok" nepočítá: její 403 nesmí shodit zdraví celého serveru
     let body = json!({"ok": duk_ok && dpmul_ok,
                       "uptimeMs": sh.start.elapsed().as_millis() as u64,
-                      "duk": duk, "dpmul": dpmul, "sz": sz,
+                      "duk": duk, "dpmul": dpmul, "sz": sz, "dpmd": dpmd, "pid": pid,
                       "rateLimit": {"enabled": sh.limiter.is_some(), "perMin": sh.cfg.rate_per_min,
                                     "burst": sh.cfg.rate_burst,
                                     "limitedTotal": sh.limiter.as_ref().map_or(0, |l| l.limited_total())}});
@@ -787,6 +1080,8 @@ fn handle(rq: tiny_http::Request, sh: &Shared) {
                     "/api/raw/duk": "DÚK (Portabo) s držením zmizelých vozidel",
                     "/api/raw/dpmul": "DPMÚL, poslední odpověď",
                     "/api/raw/sz": "Správa železnic, poslední odpověď",
+                    "/api/raw/dpmd": "DPMD (Děčín), vozidla ve službě bez řidičů",
+                    "/api/raw/pid": "PID (Golemio), rozebraná vozidla, jedno na oběh",
                     "/api/health": "stav serveru a zdrojů"
                 }
             }))
@@ -801,6 +1096,16 @@ fn handle(rq: tiny_http::Request, sh: &Shared) {
         }
         "/api/raw/sz" => {
             let (b, age) = sz_body(sh);
+            x_age = Some(age.map_or(-1, |a| a as i64));
+            b
+        }
+        "/api/raw/dpmd" => {
+            let (b, age) = dpmd_body(sh);
+            x_age = Some(age.map_or(-1, |a| a as i64));
+            b
+        }
+        "/api/raw/pid" => {
+            let (b, age) = pid_body(sh);
             x_age = Some(age.map_or(-1, |a| a as i64));
             b
         }
@@ -876,6 +1181,27 @@ fn main() {
             blocked_count: 0,
             last_request: 0.0,
         }),
+        dpmd: Mutex::new(Dpmd {
+            payload: Arc::from(DPMD_EMPTY),
+            list: Vec::new(),
+            list_ts: 0.0,
+            last_ok: 0.0,
+            failures: 0,
+            last_error: String::new(),
+            vehicles: 0,
+            last_fetch_ms: 0,
+        }),
+        pid: Mutex::new(Pid {
+            list: Vec::new(),
+            list_ts: 0.0,
+            last_ok: 0.0,
+            failures: 0,
+            last_error: String::new(),
+            vehicles: 0,
+            features: 0,
+            blocked_until: 0.0,
+            last_fetch_ms: 0,
+        }),
         vcache: Mutex::new((0.0, Arc::from(&b""[..]))),
         limiter: (cfg.rate_per_min > 0.0).then(|| RateLimiter::new(cfg.rate_per_min, cfg.rate_burst)),
         stop: Stop { m: Mutex::new(false), cv: Condvar::new() },
@@ -899,6 +1225,15 @@ fn main() {
             let s = sh.clone();
             small("sz").spawn(move || sz_poller(s)).unwrap();
         }
+        if cfg.dpmd_enabled {
+            let s = sh.clone();
+            small("dpmd").spawn(move || dpmd_poller(s)).unwrap();
+        }
+        if cfg.pid_enabled {
+            let s = sh.clone();
+            // větší zásobník: rozebírá se několik MB JSONu
+            thread::Builder::new().name("pid".into()).stack_size(2 << 20).spawn(move || pid_poller(s)).unwrap();
+        }
     }
 
     let server = Arc::new(
@@ -912,7 +1247,11 @@ fn main() {
     } else {
         info!("rate limit vypnut (RATE_PER_MIN=0)");
     }
-    info!("poslouchám na {}:{}, upstream DÚK {}, DPMÚL {}, SŽ {}", cfg.bind, cfg.port, cfg.upstream, cfg.dpmul_url, if cfg.sz_enabled { "zapnuta" } else { "vypnuta" });
+    info!(
+        "PID (Golemio): {}",
+        if cfg.pid_enabled { "zapnuto" } else if cfg.pid_key.is_empty() { "vypnuto (chybí GOLEMIO_API_KEY)" } else { "vypnuto (PID=0)" }
+    );
+    info!("poslouchám na {}:{}, upstream DÚK {}, DPMÚL {}, SŽ {}, DPMD {}", cfg.bind, cfg.port, cfg.upstream, cfg.dpmul_url, if cfg.sz_enabled { "zapnuta" } else { "vypnuta" }, if cfg.dpmd_enabled { cfg.dpmd_url.as_str() } else { "vypnut" });
 
     let workers: Vec<_> = (0..HTTP_WORKERS)
         .map(|i| {

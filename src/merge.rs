@@ -41,6 +41,9 @@ pub struct Vehicle {
     pub sources: Vec<String>,
     pub ids: Vec<String>,
     pub uid: String,
+    /// PID: klíč vozidla "<route_type>:<číslo vozu>" / "train:<číslo vlaku>" / "trip:<gtfs spoj>" (nejde do výstupu)
+    #[serde(skip)]
+    pub vkey: String,
 }
 
 pub struct SourceInput {
@@ -538,6 +541,14 @@ fn train_no(v: &Vehicle) -> String {
 }
 
 fn same_vehicle(a: &Vehicle, b: &Vehicle) -> bool {
+    // Děčínské vozy (DPMD) mají vlastní číslování, které se s ústeckým překrývá (834 je v obou městech)
+    // a žádný jiný zdroj je nezná: nikdy se neslučují s ničím jiným.
+    if a.source == "dpmd" || b.source == "dpmd" {
+        return false;
+    }
+    // PID číslo vozu je z jiné číselné řady než DÚK (a mezi druhy dopravy se opakuje): u autobusů se s jiným zdrojem
+    // páruje podle linky a polohy. Vlaky se párují číslem vlaku jako vždy (PID, SŽ i DÚK ho mají v `cis`).
+    let pid_pair = a.source == "pid" || b.source == "pid";
     if a.train || b.train {
         let (na, nb) = (train_no(a), train_no(b));
         if !na.is_empty() && na == nb {
@@ -546,7 +557,7 @@ fn same_vehicle(a: &Vehicle, b: &Vehicle) -> bool {
         if !na.is_empty() && !nb.is_empty() {
             return false; // jiné číslo vlaku = jiný vlak
         }
-    } else if a.id != 0 && b.id != 0 {
+    } else if a.id != 0 && b.id != 0 && !pid_pair {
         return same_vehicle_id(a.id, b.id);
     }
     if norm_line(&a.line) != norm_line(&b.line) {
@@ -615,7 +626,18 @@ fn resolve(group: Vec<Vehicle>) -> Vehicle {
     w.final_station = final_station;
     w.sources = sources;
     w.ids = ids;
+    // PID autobus sloučený s DÚK: uid dává ten druhý zdroj, aby se nezměnilo podle toho, kdo zrovna vyhrál
+    if !train && group.iter().any(|v| v.source == "pid") {
+        if let Some(o) = group.iter().find(|v| v.source != "pid") {
+            w.uid = uid_of(o);
+        }
+    }
     w
+}
+
+/// Pražské vozy PID (tramvaj, metro, přívoz, trolejbus, pražský autobus) žádný jiný zdroj nezná: neseskupují se.
+fn standalone(v: &Vehicle) -> bool {
+    v.source == "pid" && !v.train && v.segment == "city"
 }
 
 pub fn fuse(inputs: &[SourceInput]) -> Vec<Vehicle> {
@@ -626,7 +648,7 @@ pub fn fuse(inputs: &[SourceInput]) -> Vec<Vehicle> {
         let mut groups: Vec<Vec<Vehicle>> = Vec::new();
         for input in &ordered {
             for v in &input.vehicles {
-                if v.segment != segment {
+                if v.segment != segment || standalone(v) {
                     continue;
                 }
                 let mut target: Option<usize> = None;
@@ -645,6 +667,17 @@ pub fn fuse(inputs: &[SourceInput]) -> Vec<Vehicle> {
                     Some(gi) => groups[gi].push(v.clone()),
                     None => groups.push(vec![v.clone()]),
                 }
+            }
+        }
+        for input in &ordered {
+            if segment != "city" {
+                break;
+            }
+            for v in input.vehicles.iter().filter(|v| standalone(v)) {
+                let mut v = v.clone();
+                v.sources = vec![v.source.clone()];
+                v.ids = if v.id != 0 { vec![format!("{}:{}", v.source, v.id)] } else { vec![] };
+                out.push(v);
             }
         }
         for g in groups {
@@ -673,8 +706,14 @@ pub fn fuse(inputs: &[SourceInput]) -> Vec<Vehicle> {
 
 /// Stabilní klíč vozu napříč zdroji (ID se mezi DPMÚL a DÚK liší předponou 30).
 pub fn uid_of(v: &Vehicle) -> String {
+    if v.source == "dpmd" && v.id != 0 {
+        return format!("d{}", v.id); // vlastní číselná řada, nesmí splynout s "v834" z Ústí
+    }
     if v.train && !v.cis.is_empty() {
         return format!("t{}", v.cis.trim().trim_start_matches('0'));
+    }
+    if v.source == "pid" && !v.vkey.is_empty() {
+        return format!("g{}", v.vkey); // PID: číslo vozu platí jen v rámci druhu dopravy, nesmí splynout s "v451" z Ústí
     }
     if v.id != 0 {
         return format!("v{}", base_vehicle_id(v.id));
@@ -729,8 +768,9 @@ struct Snapshot<'a> {
 pub fn snapshot(inputs: &[SourceInput], now_s: f64, duk_outage: bool, duk_last_ok: f64) -> Vec<u8> {
     let mut vehicles = fuse(inputs);
     for v in vehicles.iter_mut() {
-        let u = uid_of(v);
-        v.uid = u;
+        if v.uid.is_empty() {
+            v.uid = uid_of(v);
+        }
     }
     let vehicles = dedupe_by_uid(vehicles);
     let mut live: Vec<&SourceInput> = inputs.iter().filter(|r| r.health == "live" && !r.vehicles.is_empty()).collect();
@@ -809,6 +849,95 @@ mod tests {
     #[test]
     fn uid_same_for_both_sources() {
         assert_eq!(uid_of(&veh("dpmul", 451, 50.0, "1", 0)), uid_of(&veh("duk", 300451, 50.0, "1", 0)));
+    }
+
+    #[test]
+    fn dpmd_never_merges_with_usti_vehicle_of_same_number() {
+        let dpmul = inp("dpmul", 0, &["city"], "live", 90, vec![veh("dpmul", 834, 50.6601, "81", 2)]);
+        // stejné číslo vozu i linka a poloha, přesto jiné město
+        let dpmd = inp("dpmd", 0, &[], "live", 90, vec![veh("dpmd", 834, 50.6601, "81", 2)]);
+        let out = fuse(&[dpmul, dpmd]);
+        assert_eq!(out.len(), 2);
+        assert_ne!(uid_of(&veh("dpmd", 834, 50.0, "1", 0)), uid_of(&veh("dpmul", 834, 50.0, "1", 0)));
+    }
+
+    #[test]
+    fn dpmd_does_not_cover_segments_or_get_ghosted() {
+        // starý děčínský vůz se nezahodí jen proto, že Ústí je živé; a DPMD nezamaskuje zastaralé DÚK vozy
+        let dpmul = inp("dpmul", 0, &["city"], "live", 90, vec![veh("dpmul", 500, 50.6, "81", 1)]);
+        let dpmd = inp("dpmd", 0, &[], "live", 90, vec![veh("dpmd", 800, 50.78, "201", 300)]);
+        assert_eq!(fuse(&[dpmul, dpmd]).len(), 2);
+        let dpmd = inp("dpmd", 0, &[], "live", 90, vec![]);
+        let duk = inp("duk", 1, &["city", "regional"], "live", 40, vec![veh("duk", 300777, 50.65, "81", 200)]);
+        assert_eq!(fuse(&[dpmd, duk]).len(), 1);
+    }
+
+    fn train(source: &str, no: &str, lat: f64, age: i64, line: &str) -> Vehicle {
+        Vehicle { source: source.into(), segment: "regional".into(), train: true, cis: no.into(), id: no.parse().unwrap_or(0), lat, lng: 14.04, line: line.into(), age_sec: age, ..Default::default() }
+    }
+
+    #[test]
+    fn pid_train_merges_with_sz_by_train_number() {
+        let sz = inp("train", 3, &["regional"], "live", 40, vec![train("train", "9715", 50.1, 4, "Os 9715"), train("train", "9999", 50.3, 4, "Os 9999")]);
+        let mut p = train("pid", "9715", 50.1001, 12, "S9");
+        p.dest = "Praha".into();
+        p.delay = 3;
+        let pid = inp("pid", 2, &[], "live", 90, vec![p]);
+        let out = fuse(&[sz, pid]);
+        assert_eq!(out.len(), 2, "vlak 9715 z obou zdrojů je jeden, 9999 jen v SŽ");
+        let m = out.iter().find(|v| v.cis == "9715").unwrap();
+        assert_eq!(m.sources, vec!["pid", "train"]);
+        assert_eq!(m.source, "train", "SŽ je čerstvější");
+        assert_eq!(m.dest, "Praha", "chybějící údaj se doplní z PID");
+        assert_eq!(uid_of(m), "t9715");
+    }
+
+    #[test]
+    fn pid_train_with_other_number_is_not_merged() {
+        let sz = inp("train", 3, &["regional"], "live", 40, vec![train("train", "9715", 50.1, 4, "Os 9715")]);
+        let pid = inp("pid", 2, &[], "live", 90, vec![train("pid", "9716", 50.1, 4, "Os 9716")]);
+        assert_eq!(fuse(&[sz, pid]).len(), 2);
+    }
+
+    #[test]
+    fn pid_regional_bus_merges_with_duk_by_line_and_place_and_keeps_uid() {
+        let mut d = veh("duk", 24567, 50.0, "388", 8);
+        d.segment = "regional".into();
+        let duk = inp("duk", 1, &["city", "regional"], "live", 40, vec![d]);
+        let mut p = veh("pid", 7694, 50.0003, "388", 1);
+        p.segment = "regional".into();
+        p.vkey = "3:7694".into();
+        p.dest = "Mělník".into();
+        let pid = inp("pid", 2, &[], "live", 90, vec![p]);
+        let out = fuse(&[duk, pid]);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].source.as_str(), out[0].dest.as_str()), ("pid", "Mělník"));
+        assert_eq!(out[0].uid, uid_of(&veh("duk", 24567, 50.0, "388", 0)), "uid podle DÚK, i když vyhrál PID");
+        assert_eq!(out[0].sources, vec!["duk", "pid"]);
+    }
+
+    #[test]
+    fn pid_city_vehicles_never_merge_and_uid_has_own_namespace() {
+        // stejné číslo vozu a linka i místo jako ústecký vůz: PID pražský vůz je samostatný
+        let dpmul = inp("dpmul", 0, &["city"], "live", 90, vec![veh("dpmul", 451, 50.0, "9", 2)]);
+        let mut p = veh("pid", 451, 50.0, "9", 2);
+        p.vkey = "0:451".into();
+        let pid = inp("pid", 2, &[], "live", 90, vec![p.clone()]);
+        let mut out = fuse(&[dpmul, pid]);
+        assert_eq!(out.len(), 2);
+        let mut q = p;
+        q.vkey = "3:451".into();
+        assert_ne!(uid_of(&q), uid_of(&out.remove(0)));
+        assert_eq!(uid_of(&q), "g3:451");
+    }
+
+    #[test]
+    fn pid_city_vehicle_survives_stale_while_duk_is_live() {
+        let duk = inp("duk", 1, &["city", "regional"], "live", 40, vec![]);
+        let mut p = veh("pid", 1, 50.08, "22", 300);
+        p.vkey = "0:1".into();
+        let pid = inp("pid", 2, &[], "live", 90, vec![p]);
+        assert_eq!(fuse(&[duk, pid]).len(), 1);
     }
 
     #[test]

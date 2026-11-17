@@ -2,7 +2,7 @@
 //! běžné HTTP knihovny User-Agent přidávají vždy, proto minimální vlastní klient nad native-tls),
 //! převod S-JTSK → WGS84 a parsování vrstvy vlaků. Port ze lib/sources.mjs.
 
-use crate::merge::{js_number, js_parse_int, num_or0, str_or_empty, Vehicle};
+use crate::merge::{in_bbox, js_number, js_parse_int, num_or0, str_or_empty, Bbox, Vehicle};
 use serde_json::Value;
 use std::{
     io::{Read, Write},
@@ -221,8 +221,8 @@ pub fn sjtsk_to_wgs84(east: f64, north: f64) -> Option<(f64, f64)> {
     }
 }
 
-/// Odpověď SŽ ({"result":[...]}) → všechny vlaky.
-pub fn parse_sz(data: &Value) -> Vec<Vehicle> {
+/// Odpověď SŽ ({"result":[...]}) → vlaky v obdélníku `bbox` (None = všechny).
+pub fn parse_sz(data: &Value, bbox: Option<&Bbox>) -> Vec<Vehicle> {
     let mut out = Vec::new();
     let Some(arr) = data.get("result").and_then(|r| r.as_array()) else { return out };
     for (i, f) in arr.iter().enumerate() {
@@ -235,6 +235,9 @@ pub fn parse_sz(data: &Value) -> Vec<Vehicle> {
             continue;
         }
         let Some((lat, lng)) = sjtsk_to_wgs84(js_number(c.first()), js_number(c.get(1))) else { continue };
+        if !in_bbox(bbox, lat, lng) {
+            continue;
+        }
         let cat = str_or_empty(p.get("tt")).trim().to_string();
         let num = str_or_empty(p.get("tn")).trim().to_string();
         let parsed_id = js_parse_int(Some(&Value::String(num.clone())));
@@ -278,13 +281,17 @@ mod tests {
 
     #[test]
     fn parse_trains() {
-        let out = parse_sz(&json!({"result": [
+        let data = json!({"result": [
             {"properties": {"type": "V", "tt": "Os", "tn": "9780", "ln": "Louny", "de": 3, "d": "ČD", "id": "x1"}, "geometry": {"coordinates": [-743000, -1043000]}},
             {"properties": {"type": "S", "tn": "1"}, "geometry": {"coordinates": [-743000, -1043000]}},
             {"properties": {"type": "V", "tn": "2"}, "geometry": {"coordinates": [0, 0]}},
-        ]}));
+        ]});
+        let out = parse_sz(&data, None);
         assert_eq!(out.len(), 1);
         assert_eq!((out[0].line.as_str(), out[0].cis.as_str(), out[0].delay, out[0].id), ("Os 9780", "9780", 3, 9780));
+        // Praha je v obdélníku, Ostrava ne
+        assert_eq!(parse_sz(&data, Some(&[49.15, 12.8, 51.1, 15.4])).len(), 1);
+        assert_eq!(parse_sz(&data, Some(&[49.9, 17.0, 50.5, 18.5])).len(), 0);
     }
 
     #[test]

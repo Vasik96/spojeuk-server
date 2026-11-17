@@ -11,7 +11,7 @@
 //! `Vehicle.cis` u vlaků nese číslo vlaku stejně jako u SŽ a DÚK, spojí je `merge::fuse` do jednoho vlaku.
 //! Vlak se bere jen za jízdy: bez čísla vozu nelze poznat, kde stojí ten, co teprve pojede.
 
-use crate::merge::{js_number, js_parse_int, js_string, js_truthy, parse_time_ms, Vehicle};
+use crate::merge::{in_bbox, js_number, js_parse_int, js_string, js_truthy, parse_time_ms, Bbox, Vehicle};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -59,11 +59,11 @@ struct Meta<'a> {
     idle: bool,
 }
 
-/// Feature → vozidlo, nebo None (bez polohy / času nebo příliš stará). Geografický filtr žádný.
-fn vehicle_of(f: &Value, props: &Value, now_ms: i64, m: &Meta) -> Option<Vehicle> {
+/// Feature → vozidlo, nebo None (bez polohy / času, příliš stará nebo mimo `bbox`).
+fn vehicle_of(f: &Value, props: &Value, now_ms: i64, m: &Meta, bbox: Option<&Bbox>) -> Option<Vehicle> {
     let c = at(f, &["geometry", "coordinates"])?.as_array()?;
     let (lng, lat) = (js_number(c.first()), js_number(c.get(1)));
-    if lat.is_nan() || lng.is_nan() || lat == 0.0 || lng == 0.0 {
+    if lat.is_nan() || lng.is_nan() || lat == 0.0 || lng == 0.0 || !in_bbox(bbox, lat, lng) {
         return None;
     }
     // bez času určení nelze poznat stáří, takže se takový záznam nebere
@@ -140,7 +140,7 @@ struct Group {
 }
 
 /// Odpověď Golemio (FeatureCollection) → jedno vozidlo na oběh (viz výše).
-pub fn parse(data: &Value, now_ms: i64) -> Vec<Vehicle> {
+pub fn parse(data: &Value, now_ms: i64, bbox: Option<&Bbox>) -> Vec<Vehicle> {
     let Some(features) = data.get("features").and_then(|v| v.as_array()) else { return Vec::new() };
     let mut order: Vec<Group> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -197,14 +197,14 @@ pub fn parse(data: &Value, now_ms: i64) -> Vec<Vehicle> {
                 Some((r, s, _)) => rank < *r || (rank == *r && start > *s),
             };
             if better {
-                if let Some(v) = vehicle_of(f, props, now_ms, &meta) {
+                if let Some(v) = vehicle_of(f, props, now_ms, &meta, bbox) {
                     g.running = Some((rank, start, v));
                 }
             }
         } else {
             let better = g.upcoming.as_ref().map_or(true, |(s, _)| start < *s);
             if better {
-                if let Some(v) = vehicle_of(f, props, now_ms, &meta) {
+                if let Some(v) = vehicle_of(f, props, now_ms, &meta, bbox) {
                     g.upcoming = Some((start, v));
                 }
             }
@@ -250,7 +250,7 @@ mod tests {
             feat("on_track", 0, Some("9001"), "t1", "", "2026-11-16T10:55:00Z", 14.4, 50.08),
             feat("before_track", 0, Some("9001"), "t2", "", "2026-11-16T11:30:00Z", 14.4, 50.08),
         ]);
-        let v = parse(&d, now_ms());
+        let v = parse(&d, now_ms(), None);
         assert_eq!(v.len(), 1);
         let v = &v[0];
         assert_eq!((v.source.as_str(), v.segment.as_str(), v.id, v.line.as_str(), v.state, v.delay, v.age_sec), ("pid", "city", 9001, "9", 0, 2, 5));
@@ -265,7 +265,7 @@ mod tests {
             feat("before_track_delayed", 0, Some("9002"), "soon", "", "2026-11-16T11:10:00Z", 14.4, 50.08),
             feat("after_track", 0, Some("9003"), "x", "", "2026-11-16T10:00:00Z", 14.4, 50.08),
         ]);
-        let v = parse(&d, now_ms());
+        let v = parse(&d, now_ms(), None);
         assert_eq!(v.len(), 1, "after_track samotné se nebere");
         assert_eq!((v[0].id, v[0].state, v[0].delay), (9002, 2, 0));
     }
@@ -278,9 +278,9 @@ mod tests {
             c,
             feat("on_track", 0, Some("1"), "a", "", "2026-11-16T10:55:00Z", 0.0, 0.0),
         ]);
-        assert!(parse(&d, now_ms()).is_empty());
+        assert!(parse(&d, now_ms(), None).is_empty());
         // stará poloha
-        assert!(parse(&collection(&[feat("on_track", 0, Some("3"), "d", "", "2026-11-16T10:55:00Z", 14.4, 50.08)]), now_ms() + 700_000).is_empty());
+        assert!(parse(&collection(&[feat("on_track", 0, Some("3"), "d", "", "2026-11-16T10:55:00Z", 14.4, 50.08)]), now_ms() + 700_000, None).is_empty());
     }
 
     #[test]
@@ -289,7 +289,7 @@ mod tests {
             feat("on_track", 0, Some("7000"), "tram", "", "2026-11-16T10:55:00Z", 14.4, 50.08),
             feat("on_track", 3, Some("7000"), "bus", "", "2026-11-16T10:55:00Z", 14.5, 50.09),
         ]);
-        let v = parse(&d, now_ms());
+        let v = parse(&d, now_ms(), None);
         assert_eq!(v.len(), 2);
         assert_ne!(v[0].vkey, v[1].vkey);
     }
@@ -299,7 +299,7 @@ mod tests {
         let d = collection(&[feat(
             "on_track", 3, Some("5555"), "b", r#","cis":{"line_id":"100388","trip_number":42}"#, "2026-11-16T10:55:00Z", 14.4, 50.0,
         )]);
-        let v = &parse(&d, now_ms())[0];
+        let v = &parse(&d, now_ms(), None)[0];
         assert_eq!((v.segment.as_str(), v.city, v.cis.as_str(), v.trip.as_str(), v.train), ("regional", false, "100388", "42", false));
     }
 
@@ -310,7 +310,7 @@ mod tests {
             feat("on_track", 2, None, "z1", cis, "2026-11-16T10:55:00Z", 14.3, 50.1),
             feat("before_track", 2, None, "z2", r#","cis":{"line_id":"none","trip_number":"9999"}"#, "2026-11-16T11:30:00Z", 14.3, 50.1),
         ]);
-        let v = parse(&d, now_ms());
+        let v = parse(&d, now_ms(), None);
         assert_eq!(v.len(), 1);
         let t = &v[0];
         assert!(t.train && t.segment == "regional" && !t.city);
@@ -320,7 +320,16 @@ mod tests {
     #[test]
     fn metro_without_fleet_is_keyed_by_trip() {
         let d = collection(&[feat("on_track", 1, None, "metro-1", "", "2026-11-16T10:55:00Z", 14.4, 50.08)]);
-        let v = &parse(&d, now_ms())[0];
+        let v = &parse(&d, now_ms(), None)[0];
         assert_eq!((v.vkey.as_str(), v.id, v.segment.as_str()), ("trip:metro-1", 0, "city"));
+    }
+
+    #[test]
+    fn bbox_filters() {
+        use crate::merge::parse_bbox;
+        let d = collection(&[feat("on_track", 0, Some("1"), "a", "", "2026-11-16T10:55:00Z", 14.4, 50.08)]);
+        assert_eq!(parse(&d, now_ms(), parse_bbox("49.2,13.0,51.0,15.5").as_ref()).len(), 1);
+        assert_eq!(parse(&d, now_ms(), parse_bbox("50.5,13.0,51.0,14.0").as_ref()).len(), 0);
+        assert!(parse_bbox("1,2,3").is_none() && parse_bbox("5,5,4,4").is_none() && parse_bbox("1,2,3,4,5").is_none());
     }
 }

@@ -6,7 +6,6 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 const SAME_SPOT_M: f64 = 150.0;
-const FRESH_SLACK_S: i64 = 5;
 const M_PER_DEG_LAT: f64 = 110540.0;
 const M_PER_DEG_LNG: f64 = 111320.0;
 const DPMUL_AGENCY: &str = "Dopravní podnik města Ústí nad Labem";
@@ -49,7 +48,6 @@ pub struct Vehicle {
 pub struct SourceInput {
     pub id: &'static str,
     pub name: &'static str,
-    pub priority: i32,
     pub segments: &'static [&'static str],
     pub health: &'static str, // live | stale | down
     pub stale_vehicle_sec: i64,
@@ -67,6 +65,23 @@ pub fn health_of(last_ok: f64, now: f64, max_age_s: f64) -> &'static str {
     } else {
         "stale"
     }
+}
+
+/// Obdélník (lat_min, lng_min, lat_max, lng_max) pro omezení zdroje; None = bez omezení.
+pub type Bbox = [f64; 4];
+
+/// "49.15,12.8,51.1,15.4" → Bbox; nesmyslná hodnota = None.
+pub fn parse_bbox(s: &str) -> Option<Bbox> {
+    let p: Vec<f64> = s.split(',').filter_map(|x| x.trim().parse::<f64>().ok()).collect();
+    if p.len() == 4 && s.split(',').count() == 4 && p[0] < p[2] && p[1] < p[3] {
+        Some([p[0], p[1], p[2], p[3]])
+    } else {
+        None
+    }
+}
+
+pub fn in_bbox(b: Option<&Bbox>, lat: f64, lng: f64) -> bool {
+    b.map_or(true, |b| lat >= b[0] && lng >= b[1] && lat <= b[2] && lng <= b[3])
 }
 
 pub fn is_mhd(vid: i64) -> bool {
@@ -587,15 +602,13 @@ macro_rules! pick_opt {
     }};
 }
 
-/// Vítěz skupiny: čerstvější poloha, při shodě vyšší priorita (skupina je řazená podle priority).
+/// Vítěz skupiny: zdroj s nejčerstvější polohou (nejnižší `age_sec`). Žádná pevná priorita: u každého vozu
+/// rozhoduje, který zdroj ho právě hlásí nejnověji. Při přesné shodě stáří vyhrává první ve skupině
+/// (skupina je řazená podle id zdroje, takže výsledek je deterministický a nepřeskakuje mezi voláními).
 fn resolve(group: Vec<Vehicle>) -> Vehicle {
     let mut wi = 0usize;
     for bi in 1..group.len() {
-        let (a, b) = (group[wi].age_sec, group[bi].age_sec);
-        if a + FRESH_SLACK_S < b {
-            continue;
-        }
-        if b + FRESH_SLACK_S < a {
+        if group[bi].age_sec < group[wi].age_sec {
             wi = bi;
         }
     }
@@ -641,8 +654,9 @@ fn standalone(v: &Vehicle) -> bool {
 }
 
 pub fn fuse(inputs: &[SourceInput]) -> Vec<Vehicle> {
+    // pořadí zdrojů slouží jen k deterministickému řazení skupin a ids (ne k preferenci zdroje)
     let mut ordered: Vec<&SourceInput> = inputs.iter().collect();
-    ordered.sort_by_key(|i| i.priority);
+    ordered.sort_by_key(|i| i.id);
     let mut out = Vec::new();
     for segment in ["city", "regional"] {
         let mut groups: Vec<Vec<Vehicle>> = Vec::new();
@@ -686,14 +700,22 @@ pub fn fuse(inputs: &[SourceInput]) -> Vec<Vehicle> {
                 continue;
             }
             let mut v = g.into_iter().next().unwrap();
-            // vůz, který zná jen jeden zdroj, se zahodí, když je zastaralý a jiný zdroj s vyšší prioritou ten segment čerstvě pokrývá
-            let ghost = match ordered.iter().find(|i| i.id == v.source) {
-                Some(own) => {
-                    v.age_sec > own.stale_vehicle_sec
-                        && ordered.iter().any(|o| o.priority < own.priority && o.health == "live" && o.segments.contains(&segment))
-                }
-                None => false,
-            };
+            // Vůz, který zná jen jeden zdroj, se zahodí, když je zastaralý a jiný živý zdroj ten segment pro stejný druh
+            // vozidel (vlak / autobus) právě čerstvě pokrývá a vůz nevidí. DPMD (vlastní číslování, nikdo jiný tam nejezdí)
+            // se nezahazuje nikdy.
+            let ghost = v.source != "dpmd"
+                && match ordered.iter().find(|i| i.id == v.source) {
+                    Some(own) => {
+                        v.age_sec > own.stale_vehicle_sec
+                            && ordered.iter().any(|o| {
+                                o.id != own.id
+                                    && o.health == "live"
+                                    && o.segments.contains(&segment)
+                                    && o.vehicles.iter().any(|x| x.segment == segment && x.train == v.train)
+                            })
+                    }
+                    None => false,
+                };
             if !ghost {
                 v.sources = vec![v.source.clone()];
                 v.ids = if v.id != 0 { vec![format!("{}:{}", v.source, v.id)] } else { vec![] };
@@ -721,12 +743,12 @@ pub fn uid_of(v: &Vehicle) -> String {
     format!("p{:.4},{:.4}", v.lat, v.lng)
 }
 
-/// Jedno vozidlo = jeden záznam na uid; ponechá se čerstvější poloha, při shodě první (vyšší priorita).
+/// Jedno vozidlo = jeden záznam na uid; ponechá se čerstvější poloha, při shodě první.
 fn dedupe_by_uid(vs: Vec<Vehicle>) -> Vec<Vehicle> {
     let mut best: HashMap<String, usize> = HashMap::new();
     for (i, v) in vs.iter().enumerate() {
         let replace = match best.get(&v.uid) {
-            Some(&j) => v.age_sec + FRESH_SLACK_S < vs[j].age_sec,
+            Some(&j) => v.age_sec < vs[j].age_sec,
             None => true,
         };
         if replace {
@@ -742,7 +764,6 @@ fn dedupe_by_uid(vs: Vec<Vehicle>) -> Vec<Vehicle> {
 struct SourceInfo<'a> {
     id: &'a str,
     name: &'a str,
-    priority: i32,
     health: &'a str,
     vehicles: usize,
     failures: u64,
@@ -773,8 +794,7 @@ pub fn snapshot(inputs: &[SourceInput], now_s: f64, duk_outage: bool, duk_last_o
         }
     }
     let vehicles = dedupe_by_uid(vehicles);
-    let mut live: Vec<&SourceInput> = inputs.iter().filter(|r| r.health == "live" && !r.vehicles.is_empty()).collect();
-    live.sort_by_key(|r| r.priority);
+    let live: Vec<&SourceInput> = inputs.iter().filter(|r| r.health == "live" && !r.vehicles.is_empty()).collect();
     let any_ok = inputs.iter().any(|r| r.health != "down");
     let snap = Snapshot {
         time: (now_s * 1000.0) as i64,
@@ -789,7 +809,6 @@ pub fn snapshot(inputs: &[SourceInput], now_s: f64, duk_outage: bool, duk_last_o
             .map(|r| SourceInfo {
                 id: r.id,
                 name: r.name,
-                priority: r.priority,
                 health: r.health,
                 vehicles: r.vehicles.len(),
                 failures: r.failures,
@@ -810,8 +829,8 @@ mod tests {
     fn veh(source: &str, id: i64, lat: f64, line: &str, age: i64) -> Vehicle {
         Vehicle { source: source.into(), segment: "city".into(), id, lat, lng: 14.04, line: line.into(), age_sec: age, ..Default::default() }
     }
-    fn inp(id: &'static str, priority: i32, segs: &'static [&'static str], health: &'static str, stale: i64, vehicles: Vec<Vehicle>) -> SourceInput {
-        SourceInput { id, name: id, priority, segments: segs, health, stale_vehicle_sec: stale, vehicles, held: 0, failures: 0, last_error: String::new() }
+    fn inp(id: &'static str, segs: &'static [&'static str], health: &'static str, stale: i64, vehicles: Vec<Vehicle>) -> SourceInput {
+        SourceInput { id, name: id, segments: segs, health, stale_vehicle_sec: stale, vehicles, held: 0, failures: 0, last_error: String::new() }
     }
 
     #[test]
@@ -825,12 +844,12 @@ mod tests {
 
     #[test]
     fn fuse_same_bus_freshest_wins_and_trip_filled() {
-        let dpmul = inp("dpmul", 0, &["city"], "live", 90, vec![veh("dpmul", 451, 50.6601, "81", 2)]);
+        let dpmul = inp("dpmul", &["city"], "live", 90, vec![veh("dpmul", 451, 50.6601, "81", 2)]);
         let mut d = veh("duk", 300451, 50.66, "81", 20);
         d.cis = "000081".into();
         d.trip = "2359".into();
         d.dest = "Církvice".into();
-        let duk = inp("duk", 1, &["city", "regional"], "live", 40, vec![d]);
+        let duk = inp("duk", &["city", "regional"], "live", 40, vec![d]);
         let out = fuse(&[duk, dpmul]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].source, "dpmul");
@@ -840,9 +859,9 @@ mod tests {
     }
 
     #[test]
-    fn fuse_ghost_removed_when_higher_priority_live() {
-        let dpmul = inp("dpmul", 0, &["city"], "live", 90, vec![veh("dpmul", 500, 50.6, "81", 1)]);
-        let duk = inp("duk", 1, &["city", "regional"], "live", 40, vec![veh("duk", 300777, 50.65, "81", 200)]);
+    fn fuse_ghost_removed_when_other_source_live() {
+        let dpmul = inp("dpmul", &["city"], "live", 90, vec![veh("dpmul", 500, 50.6, "81", 1)]);
+        let duk = inp("duk", &["city", "regional"], "live", 40, vec![veh("duk", 300777, 50.65, "81", 200)]);
         assert_eq!(fuse(&[dpmul, duk]).len(), 1);
     }
 
@@ -853,9 +872,9 @@ mod tests {
 
     #[test]
     fn dpmd_never_merges_with_usti_vehicle_of_same_number() {
-        let dpmul = inp("dpmul", 0, &["city"], "live", 90, vec![veh("dpmul", 834, 50.6601, "81", 2)]);
+        let dpmul = inp("dpmul", &["city"], "live", 90, vec![veh("dpmul", 834, 50.6601, "81", 2)]);
         // stejné číslo vozu i linka a poloha, přesto jiné město
-        let dpmd = inp("dpmd", 0, &[], "live", 90, vec![veh("dpmd", 834, 50.6601, "81", 2)]);
+        let dpmd = inp("dpmd", &[], "live", 90, vec![veh("dpmd", 834, 50.6601, "81", 2)]);
         let out = fuse(&[dpmul, dpmd]);
         assert_eq!(out.len(), 2);
         assert_ne!(uid_of(&veh("dpmd", 834, 50.0, "1", 0)), uid_of(&veh("dpmul", 834, 50.0, "1", 0)));
@@ -864,11 +883,11 @@ mod tests {
     #[test]
     fn dpmd_does_not_cover_segments_or_get_ghosted() {
         // starý děčínský vůz se nezahodí jen proto, že Ústí je živé; a DPMD nezamaskuje zastaralé DÚK vozy
-        let dpmul = inp("dpmul", 0, &["city"], "live", 90, vec![veh("dpmul", 500, 50.6, "81", 1)]);
-        let dpmd = inp("dpmd", 0, &[], "live", 90, vec![veh("dpmd", 800, 50.78, "201", 300)]);
+        let dpmul = inp("dpmul", &["city"], "live", 90, vec![veh("dpmul", 500, 50.6, "81", 1)]);
+        let dpmd = inp("dpmd", &[], "live", 90, vec![veh("dpmd", 800, 50.78, "201", 300)]);
         assert_eq!(fuse(&[dpmul, dpmd]).len(), 2);
-        let dpmd = inp("dpmd", 0, &[], "live", 90, vec![]);
-        let duk = inp("duk", 1, &["city", "regional"], "live", 40, vec![veh("duk", 300777, 50.65, "81", 200)]);
+        let dpmd = inp("dpmd", &[], "live", 90, vec![]);
+        let duk = inp("duk", &["city", "regional"], "live", 40, vec![veh("duk", 300777, 50.65, "81", 200)]);
         assert_eq!(fuse(&[dpmd, duk]).len(), 1);
     }
 
@@ -878,11 +897,11 @@ mod tests {
 
     #[test]
     fn pid_train_merges_with_sz_by_train_number() {
-        let sz = inp("train", 3, &["regional"], "live", 40, vec![train("train", "9715", 50.1, 4, "Os 9715"), train("train", "9999", 50.3, 4, "Os 9999")]);
+        let sz = inp("train", &["regional"], "live", 40, vec![train("train", "9715", 50.1, 4, "Os 9715"), train("train", "9999", 50.3, 4, "Os 9999")]);
         let mut p = train("pid", "9715", 50.1001, 12, "S9");
         p.dest = "Praha".into();
         p.delay = 3;
-        let pid = inp("pid", 2, &[], "live", 90, vec![p]);
+        let pid = inp("pid", &[], "live", 90, vec![p]);
         let out = fuse(&[sz, pid]);
         assert_eq!(out.len(), 2, "vlak 9715 z obou zdrojů je jeden, 9999 jen v SŽ");
         let m = out.iter().find(|v| v.cis == "9715").unwrap();
@@ -894,8 +913,8 @@ mod tests {
 
     #[test]
     fn pid_train_with_other_number_is_not_merged() {
-        let sz = inp("train", 3, &["regional"], "live", 40, vec![train("train", "9715", 50.1, 4, "Os 9715")]);
-        let pid = inp("pid", 2, &[], "live", 90, vec![train("pid", "9716", 50.1, 4, "Os 9716")]);
+        let sz = inp("train", &["regional"], "live", 40, vec![train("train", "9715", 50.1, 4, "Os 9715")]);
+        let pid = inp("pid", &[], "live", 90, vec![train("pid", "9716", 50.1, 4, "Os 9716")]);
         assert_eq!(fuse(&[sz, pid]).len(), 2);
     }
 
@@ -903,12 +922,12 @@ mod tests {
     fn pid_regional_bus_merges_with_duk_by_line_and_place_and_keeps_uid() {
         let mut d = veh("duk", 24567, 50.0, "388", 8);
         d.segment = "regional".into();
-        let duk = inp("duk", 1, &["city", "regional"], "live", 40, vec![d]);
+        let duk = inp("duk", &["city", "regional"], "live", 40, vec![d]);
         let mut p = veh("pid", 7694, 50.0003, "388", 1);
         p.segment = "regional".into();
         p.vkey = "3:7694".into();
         p.dest = "Mělník".into();
-        let pid = inp("pid", 2, &[], "live", 90, vec![p]);
+        let pid = inp("pid", &[], "live", 90, vec![p]);
         let out = fuse(&[duk, pid]);
         assert_eq!(out.len(), 1);
         assert_eq!((out[0].source.as_str(), out[0].dest.as_str()), ("pid", "Mělník"));
@@ -919,10 +938,10 @@ mod tests {
     #[test]
     fn pid_city_vehicles_never_merge_and_uid_has_own_namespace() {
         // stejné číslo vozu a linka i místo jako ústecký vůz: PID pražský vůz je samostatný
-        let dpmul = inp("dpmul", 0, &["city"], "live", 90, vec![veh("dpmul", 451, 50.0, "9", 2)]);
+        let dpmul = inp("dpmul", &["city"], "live", 90, vec![veh("dpmul", 451, 50.0, "9", 2)]);
         let mut p = veh("pid", 451, 50.0, "9", 2);
         p.vkey = "0:451".into();
-        let pid = inp("pid", 2, &[], "live", 90, vec![p.clone()]);
+        let pid = inp("pid", &[], "live", 90, vec![p.clone()]);
         let mut out = fuse(&[dpmul, pid]);
         assert_eq!(out.len(), 2);
         let mut q = p;
@@ -933,11 +952,56 @@ mod tests {
 
     #[test]
     fn pid_city_vehicle_survives_stale_while_duk_is_live() {
-        let duk = inp("duk", 1, &["city", "regional"], "live", 40, vec![]);
+        let duk = inp("duk", &["city", "regional"], "live", 40, vec![]);
         let mut p = veh("pid", 1, 50.08, "22", 300);
         p.vkey = "0:1".into();
-        let pid = inp("pid", 2, &[], "live", 90, vec![p]);
+        let pid = inp("pid", &[], "live", 90, vec![p]);
         assert_eq!(fuse(&[duk, pid]).len(), 1);
+    }
+
+    #[test]
+    fn freshest_source_wins_per_vehicle_dynamically() {
+        // DÚK čerstvější než DPMÚL: vyhraje DÚK
+        let dpmul = inp("dpmul", &["city"], "live", 90, vec![veh("dpmul", 451, 50.66, "81", 30)]);
+        let duk = inp("duk", &["city", "regional"], "live", 40, vec![veh("duk", 300451, 50.66, "81", 3)]);
+        let out = fuse(&[dpmul, duk]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source, "duk");
+        // a obráceně, bez ohledu na pořadí zdrojů na vstupu
+        let dpmul = inp("dpmul", &["city"], "live", 90, vec![veh("dpmul", 451, 50.66, "81", 1)]);
+        let duk = inp("duk", &["city", "regional"], "live", 40, vec![veh("duk", 300451, 50.66, "81", 9)]);
+        let out = fuse(&[duk, dpmul]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source, "dpmul");
+    }
+
+    #[test]
+    fn fuse_equal_age_is_deterministic() {
+        let a = inp("dpmul", &["city"], "live", 90, vec![veh("dpmul", 451, 50.66, "81", 5)]);
+        let b = inp("duk", &["city", "regional"], "live", 40, vec![veh("duk", 300451, 50.66, "81", 5)]);
+        assert_eq!(fuse(&[a, b])[0].source, "dpmul");
+        let a = inp("dpmul", &["city"], "live", 90, vec![veh("dpmul", 451, 50.66, "81", 5)]);
+        let b = inp("duk", &["city", "regional"], "live", 40, vec![veh("duk", 300451, 50.66, "81", 5)]);
+        assert_eq!(fuse(&[b, a])[0].source, "dpmul");
+    }
+
+    #[test]
+    fn stale_lone_vehicle_of_any_source_dropped_when_other_source_live() {
+        // zastaralý osamělý vůz DPMÚL se zahodí, když DÚK živě pokrývá město (dřív to platilo jen opačně)
+        let dpmul = inp("dpmul", &["city"], "live", 90, vec![veh("dpmul", 500, 50.6, "81", 200)]);
+        let duk = inp("duk", &["city", "regional"], "live", 40, vec![veh("duk", 300777, 50.65, "82", 2)]);
+        let out = fuse(&[dpmul, duk]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source, "duk");
+    }
+
+    #[test]
+    fn stale_bus_kept_when_other_live_source_has_only_trains() {
+        let mut b = veh("duk", 24567, 50.0, "388", 200);
+        b.segment = "regional".into();
+        let duk = inp("duk", &["city", "regional"], "live", 40, vec![b]);
+        let sz = inp("train", &["regional"], "live", 40, vec![train("train", "9715", 50.1, 4, "Os 9715")]);
+        assert_eq!(fuse(&[duk, sz]).len(), 2);
     }
 
     #[test]

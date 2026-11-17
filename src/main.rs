@@ -50,7 +50,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ratelimit::{client_ip, ip_key, RateLimiter, Verdict};
-use merge::{SourceInput, Vehicle};
+use merge::{Bbox, SourceInput, Vehicle};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 macro_rules! info { ($($a:tt)*) => { eprintln!("INFO {}", format!($($a)*)) } }
@@ -79,6 +79,8 @@ struct Config {
     sz_url: String,
     sz_poll_s: f64,
     sz_hold_s: f64,
+    /// obdélník (lat_min,lng_min,lat_max,lng_max) pro vlaky SŽ; None = všechny
+    sz_box: Option<Bbox>,
     dpmd_enabled: bool,
     dpmd_url: String,
     dpmd_poll_s: f64,
@@ -89,6 +91,8 @@ struct Config {
     pid_key: String,
     pid_poll_s: f64,
     pid_hold_s: f64,
+    /// obdélník pro PID; None = celá PID
+    pid_box: Option<Bbox>,
     /// 0 = bez omezení
     rate_per_min: f64,
     rate_burst: f64,
@@ -103,6 +107,19 @@ fn env_str(k: &str, d: &str) -> String {
 }
 fn env_f(k: &str, d: f64) -> f64 {
     env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d)
+}
+
+/// Obdélník z prostředí "lat_min,lng_min,lat_max,lng_max"; nenastaveno = výchozí, "off" / "0" / prázdné = bez omezení.
+fn env_box(k: &str, d: Bbox) -> Option<Bbox> {
+    let Ok(v) = env::var(k) else { return Some(d) };
+    let t = v.trim().to_ascii_lowercase();
+    if matches!(t.as_str(), "" | "off" | "none" | "0") {
+        return None;
+    }
+    merge::parse_bbox(&t).or_else(|| {
+        warn!("{} '{}' nelze přečíst (lat_min,lng_min,lat_max,lng_max), platí výchozí", k, v);
+        Some(d)
+    })
 }
 
 fn is_loopback_bind(b: &str) -> bool {
@@ -137,6 +154,8 @@ impl Config {
             // SŽ banuje IP, které na ně pouští služby: nikdy rychleji než jednou za 10 s
             sz_poll_s: env_f("SZ_POLL_S", 10.5).max(10.0),
             sz_hold_s: env_f("SZ_HOLD_S", 120.0),
+            // Ústecký kraj, Praha a Středočeský kraj až na jih (Příbramsko, Benešovsko)
+            sz_box: env_box("SZ_BOX", [49.15, 12.8, 51.1, 15.4]),
             dpmd_enabled: env_str("DPMD", "1") != "0",
             dpmd_url: env_str("DPMD_URL", "https://tabla.dpmdas.cz/data/TrafficState.js"),
             // soubor se u DPMD generuje po 5 s; 10 s stačí (po gzipu ~35 KB na dotaz)
@@ -148,6 +167,8 @@ impl Config {
             // limit Golemio je 20 dotazů za 8 s na klíč, odpověď se cachuje 5 s
             pid_poll_s: env_f("PID_POLL_S", 10.0).max(5.0),
             pid_hold_s: env_f("PID_HOLD_S", 120.0),
+            // permisivně: Praha a okolí, na sever až za Ústí
+            pid_box: env_box("PID_BOX", [49.2, 13.0, 51.0, 15.5]),
             rate_per_min: env_f("RATE_PER_MIN", 30.0).max(0.0),
             rate_burst: env_f("RATE_BURST", 10.0).max(1.0),
             trust_proxy: env_f("TRUST_PROXY", if is_loopback_bind(&bind) { 1.0 } else { 0.0 }).max(0.0) as usize,
@@ -581,7 +602,7 @@ fn sz_poll_once(sh: &Shared) {
         Ok((st, _)) if !(200..300).contains(&st) => sz_fail(&mut g, format!("HTTP {st}")),
         Ok((_, body)) => match serde_json::from_slice::<Value>(&body) {
             Ok(v) => {
-                let list = sz::parse_sz(&v);
+                let list = sz::parse_sz(&v, cfg.sz_box.as_ref());
                 g.vehicles = list.len();
                 g.list = list;
                 g.payload = Arc::from(body);
@@ -736,7 +757,7 @@ fn pid_poller(sh: Arc<Shared>) {
         if !blocked {
             let res = pid_fetch(&agent, cfg).map(|data| {
                 let features = data.get("features").and_then(|f| f.as_array()).map_or(0, |a| a.len());
-                (pid::parse(&data, (now() * 1000.0) as i64), features)
+                (pid::parse(&data, (now() * 1000.0) as i64, cfg.pid_box.as_ref()), features)
             });
             let t = now();
             let mut g = lock(&sh.pid);
@@ -813,7 +834,6 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
         inputs.push(SourceInput {
             id: "dpmul",
             name: "DPMÚL",
-            priority: 0,
             segments: &["city"],
             health: merge::health_of(g.last_ok, t, 60.0),
             stale_vehicle_sec: 90,
@@ -824,8 +844,8 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
         });
     }
 
-    // DPMD (Děčín): vlastní číslování a žádný jiný zdroj tu nejezdí. Priorita 0, aby je nikdy nezahodilo
-    // pravidlo o "duších", a prázdné segments, aby zase nemaskovaly zastaralé vozy ostatních zdrojů.
+    // DPMD (Děčín): vlastní číslování a žádný jiný zdroj tu nejezdí. Merge ho nikdy nezahazuje jako "ducha"
+    // a prázdné segments zajistí, aby nemaskoval zastaralé vozy ostatních zdrojů.
     if cfg.dpmd_enabled {
         let g = lock(&sh.dpmd);
         let held_s = (t - g.list_ts).floor() as i64;
@@ -837,7 +857,6 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
         inputs.push(SourceInput {
             id: "dpmd",
             name: "DPMD",
-            priority: 0,
             segments: &[],
             health: merge::health_of(g.last_ok, t, 60.0),
             stale_vehicle_sec: 90,
@@ -873,7 +892,6 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
         inputs.push(SourceInput {
             id: "duk",
             name: "DÚK",
-            priority: 1,
             segments: &["city", "regional"],
             health: merge::health_of(g.last_ok, t, 30.0),
             stale_vehicle_sec: 40,
@@ -885,8 +903,8 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
         (outage, g.last_ok)
     };
 
-    // PID (Golemio): pořadí poloh DÚK, PID, SŽ. Nepokrývá žádný segment (segments prázdné), takže nezahazuje
-    // zastaralé vozy jiných zdrojů; jeho vlastní osamělé zastaralé vozy (regionální autobusy, vlaky) zahodí živé DÚK.
+    // PID (Golemio): nepokrývá žádný segment (segments prázdné), takže nezahazuje zastaralé vozy jiných zdrojů;
+    // jeho vlastní osamělé zastaralé vozy (regionální autobusy, vlaky) zahodí jiný živý zdroj stejného segmentu.
     if cfg.pid_enabled {
         let g = lock(&sh.pid);
         let held_s = (t - g.list_ts).floor() as i64;
@@ -897,8 +915,7 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
         };
         inputs.push(SourceInput {
             id: "pid",
-            name: "PID (Golemio)",
-            priority: 2,
+            name: "PID",
             segments: &[],
             health: merge::health_of(g.last_ok, t, 40.0),
             stale_vehicle_sec: 90,
@@ -921,7 +938,6 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
         inputs.push(SourceInput {
             id: "train",
             name: "Správa železnic",
-            priority: 3,
             segments: &["regional"],
             health: merge::health_of(g.last_ok, t, 40.0),
             stale_vehicle_sec: 40,

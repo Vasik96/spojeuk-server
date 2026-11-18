@@ -40,6 +40,9 @@ pub struct Vehicle {
     pub sources: Vec<String>,
     pub ids: Vec<String>,
     pub uid: String,
+    /// Druh dopravy pro appku (barva na mapě): bus | tram | metro | trolleybus | train | ferry | funicular.
+    /// PID ho zná z GTFS route_type, ostatní zdroje dostanou bus / train v [fuse].
+    pub mode: String,
     /// PID: klíč vozidla "<route_type>:<číslo vozu>" / "train:<číslo vlaku>" / "trip:<gtfs spoj>" (nejde do výstupu)
     #[serde(skip)]
     pub vkey: String,
@@ -625,10 +628,12 @@ fn resolve(group: Vec<Vehicle>) -> Vehicle {
         group.iter().map(|v| v.final_station).find(|s| *s != 0).unwrap_or(0)
     };
     let train = group.iter().any(|v| v.train);
+    let mode = if train { "train".to_string() } else { pick_str!(group, wi, mode) };
     let sources: Vec<String> = group.iter().map(|v| v.source.clone()).collect();
     let ids: Vec<String> = group.iter().filter(|v| v.id != 0).map(|v| format!("{}:{}", v.source, v.id)).collect();
     let mut w = group[wi].clone();
     w.train = train;
+    w.mode = mode;
     w.cis = cis;
     w.trip = trip;
     w.dest = dest;
@@ -721,6 +726,13 @@ pub fn fuse(inputs: &[SourceInput]) -> Vec<Vehicle> {
                 v.ids = if v.id != 0 { vec![format!("{}:{}", v.source, v.id)] } else { vec![] };
                 out.push(v);
             }
+        }
+    }
+    for v in &mut out {
+        if v.train {
+            v.mode = "train".into();
+        } else if v.mode.is_empty() {
+            v.mode = "bus".into();
         }
     }
     out
@@ -856,6 +868,7 @@ mod tests {
         assert_eq!(out[0].cis, "000081");
         assert_eq!(out[0].dest, "Církvice");
         assert_eq!(out[0].ids, vec!["dpmul:451", "duk:300451"]);
+        assert_eq!(out[0].mode, "bus", "zdroje bez druhu dopravy = autobus");
     }
 
     #[test]
@@ -906,6 +919,7 @@ mod tests {
         assert_eq!(out.len(), 2, "vlak 9715 z obou zdrojů je jeden, 9999 jen v SŽ");
         let m = out.iter().find(|v| v.cis == "9715").unwrap();
         assert_eq!(m.sources, vec!["pid", "train"]);
+        assert_eq!(m.mode, "train");
         assert_eq!(m.source, "train", "SŽ je čerstvější");
         assert_eq!(m.dest, "Praha", "chybějící údaj se doplní z PID");
         assert_eq!(uid_of(m), "t9715");

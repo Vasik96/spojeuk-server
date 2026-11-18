@@ -127,8 +127,22 @@ fn vehicle_of(f: &Value, props: &Value, now_ms: i64, m: &Meta, bbox: Option<&Bbo
         heading,
         city,
         vkey: m.vkey.to_string(),
+        mode: mode_of(m.rt).into(),
         ..Default::default()
     })
+}
+
+/// GTFS route_type → druh dopravy pro appku (barva na mapě).
+fn mode_of(rt: i64) -> &'static str {
+    match rt {
+        0 => "tram",
+        1 => "metro",
+        2 => "train",
+        4 => "ferry",
+        7 => "funicular",
+        11 => "trolleybus",
+        _ => "bus",
+    }
 }
 
 #[derive(Default)]
@@ -292,6 +306,7 @@ mod tests {
         let v = parse(&d, now_ms(), None);
         assert_eq!(v.len(), 2);
         assert_ne!(v[0].vkey, v[1].vkey);
+        assert_eq!((v[0].mode.as_str(), v[1].mode.as_str()), ("tram", "bus"));
     }
 
     #[test]
@@ -321,7 +336,7 @@ mod tests {
     fn metro_without_fleet_is_keyed_by_trip() {
         let d = collection(&[feat("on_track", 1, None, "metro-1", "", "2026-11-16T10:55:00Z", 14.4, 50.08)]);
         let v = &parse(&d, now_ms(), None)[0];
-        assert_eq!((v.vkey.as_str(), v.id, v.segment.as_str()), ("trip:metro-1", 0, "city"));
+        assert_eq!((v.vkey.as_str(), v.id, v.segment.as_str(), v.mode.as_str()), ("trip:metro-1", 0, "city", "metro"));
     }
 
     #[test]

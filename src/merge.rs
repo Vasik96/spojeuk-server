@@ -790,10 +790,27 @@ fn dedupe_by_uid(vs: Vec<Vehicle>) -> Vec<Vehicle> {
 
 // ---------------------------------------------------------------- výstup /api/vehicles
 
+/// Krátký popis zdroje pro lidi (appka ho ukazuje v nastavení pod názvem), aby se nový zdroj nemusel
+/// do appky přidávat ručně. Neznámý zdroj = prázdný popis.
+pub fn source_desc(id: &str) -> &'static str {
+    match id {
+        "dpmul" => "MHD Ústí nad Labem",
+        "duk" => "Ústecký kraj (DÚK), autobusy a MHD",
+        "dpmd" => "MHD Děčín",
+        "idol" => "Liberecký kraj (IDOL), autobusy a vlaky",
+        "dpkv" => "MHD Karlovy Vary",
+        "pmdp" => "MHD Plzeň: tramvaje, trolejbusy, autobusy",
+        "pid" => "Praha a Středočeský kraj (PID)",
+        "train" => "Vlaky (polohy Správy železnic)",
+        _ => "",
+    }
+}
+
 #[derive(Serialize)]
 struct SourceInfo<'a> {
     id: &'a str,
     name: &'a str,
+    desc: &'static str,
     health: &'a str,
     vehicles: usize,
     failures: u64,
@@ -839,6 +856,7 @@ pub fn snapshot(inputs: &[SourceInput], now_s: f64, duk_outage: bool, duk_last_o
             .map(|r| SourceInfo {
                 id: r.id,
                 name: r.name,
+                desc: source_desc(r.id),
                 health: r.health,
                 vehicles: r.vehicles.len(),
                 failures: r.failures,

@@ -12,6 +12,12 @@
 //! DPMD (Dopravní podnik města Děčína): městské autobusy z mapy doprava.dpmdas.cz (TrafficState.js, JavaScript
 //! místo JSONu, čte ho jsl.rs; gzip se rozbaluje v inflate.rs). DÚK Děčín nezná, tak se bere přímo od dopravce.
 //!
+//! IDOL (Liberecký kraj): autobusy a vlaky z veřejné mapy mpvnet.cz/idol/map (kvůli Česká Lípě a spojům
+//! mezi Libereckým a Ústeckým krajem), viz idol.rs. Výřez se neomezuje (celá ČR), vlaky se sloučí se SŽ.
+//!
+//! DPKV (Karlovy Vary): městské autobusy z dopravního portálu dopravniportal.dpkv.cz (souřadnice S-JTSK se převádějí
+//! na WGS84), viz dpkv.rs.
+//!
 //! PID (Golemio): všechny druhy dopravy PID včetně vlaků v oblasti PID. Zapíná se klíčem GOLEMIO_API_KEY (bez něj se
 //! kanál nedotazuje). Vlaky PID se sloučí s vlaky SŽ (a DÚK) podle čísla vlaku, viz pid.rs a merge.rs.
 //!
@@ -19,7 +25,7 @@
 //!   GET /duk/traffic, /dpmul/traffic, /health          původní (zůstávají kvůli Android appce a webu)
 //!   GET /api/                                          přehled API v2
 //!   GET /api/vehicles                                  všechna vozidla sloučená ze zdrojů (nejčerstvější poloha)
-//!   GET /api/raw/duk | /api/raw/dpmul | /api/raw/sz | /api/raw/dpmd   jednotlivé zdroje tak, jak jsou
+//!   GET /api/raw/duk | /api/raw/dpmul | /api/raw/sz | /api/raw/dpmd | /api/raw/idol | /api/raw/dpkv   jednotlivé zdroje
 //!   GET /api/raw/pid                                   PID: už rozebraná vozidla (Golemio je velké, surové se nedrží)
 //!   GET /api/health                                    totéž co /health
 //!
@@ -28,7 +34,9 @@
 //! (start, návrat z pozadí, appka bez zdroje dat si řekne hned). /health se neomezuje. Nad limit = 429 + Retry-After.
 //! Bez async runtime: pár vláken, blokující I/O.
 
+mod dpkv;
 mod dpmd;
+mod idol;
 mod inflate;
 mod jsl;
 mod merge;
@@ -85,6 +93,14 @@ struct Config {
     dpmd_url: String,
     dpmd_poll_s: f64,
     dpmd_hold_s: f64,
+    idol_enabled: bool,
+    idol_url: String,
+    idol_poll_s: f64,
+    idol_hold_s: f64,
+    dpkv_enabled: bool,
+    dpkv_base: String,
+    dpkv_poll_s: f64,
+    dpkv_hold_s: f64,
     pid_enabled: bool,
     pid_url: String,
     /// tajemství: nikdy se nelogguje ani nevypisuje
@@ -161,6 +177,15 @@ impl Config {
             // soubor se u DPMD generuje po 5 s; 10 s stačí (po gzipu ~35 KB na dotaz)
             dpmd_poll_s: env_f("DPMD_POLL_S", 10.0).max(5.0),
             dpmd_hold_s: env_f("DPMD_HOLD_S", 120.0),
+            idol_enabled: env_str("IDOL", "1") != "0",
+            idol_url: env_str("IDOL_URL", "https://mpvnet.cz/idol/map/mapData"),
+            // mapa IDOL se sama obnovuje po 10 s
+            idol_poll_s: env_f("IDOL_POLL_S", 10.0).max(5.0),
+            idol_hold_s: env_f("IDOL_HOLD_S", 120.0),
+            dpkv_enabled: env_str("DPKV", "1") != "0",
+            dpkv_base: env_str("DPKV_BASE", "https://dopravniportal.dpkv.cz/dic"),
+            dpkv_poll_s: env_f("DPKV_POLL_S", 10.0).max(5.0),
+            dpkv_hold_s: env_f("DPKV_HOLD_S", 120.0),
             pid_key: env_str("GOLEMIO_API_KEY", "").trim().to_string(),
             pid_enabled: env_str("PID", "1") != "0" && !env_str("GOLEMIO_API_KEY", "").trim().is_empty(),
             pid_url: env_str("PID_URL", "https://api.golemio.cz/v2/vehiclepositions?limit=10000&includeNotTracking=true"),
@@ -233,6 +258,17 @@ struct Sz {
     last_request: f64,
 }
 
+struct Idol {
+    payload: Arc<[u8]>, // /api/raw/idol (JSON)
+    list: Vec<Vehicle>,
+    list_ts: f64,
+    last_ok: f64,
+    failures: u64,
+    last_error: String,
+    vehicles: usize,
+    last_fetch_ms: u64,
+}
+
 struct Dpmd {
     payload: Arc<[u8]>, // /api/raw/dpmd (JSON)
     list: Vec<Vehicle>,
@@ -283,6 +319,8 @@ struct Shared {
     dpmul: Mutex<Dpmul>,
     sz: Mutex<Sz>,
     dpmd: Mutex<Dpmd>,
+    idol: Mutex<Idol>,
+    dpkv: Mutex<Idol>, // stejný stav jako IDOL (poslední seznam, raw JSON, chyby)
     pid: Mutex<Pid>,
     vcache: Mutex<(f64, Arc<[u8]>)>, // sestavený /api/vehicles a kdy
     limiter: Option<RateLimiter>,
@@ -644,6 +682,166 @@ fn sz_body(sh: &Shared) -> (Arc<[u8]>, Option<f64>) {
     (if age <= sh.cfg.sz_hold_s { body } else { empty }, Some(age))
 }
 
+// ---------------------------------------------------------------- IDOL (Liberecký kraj)
+
+const IDOL_EMPTY: &[u8] = b"{\"transmitters\":[]}";
+
+fn idol_fetch(agent: &ureq::Agent, cfg: &Config) -> Result<String, String> {
+    // výřez celé ČR: IDOL vrací všechny své vozy (i spoje mimo kraj), nic se neořezává
+    let body = r#"{"w":12.0,"s":48.5,"e":19.0,"n":51.1,"zoom":10,"showStops":false,"mapFilterId":null}"#;
+    let resp = agent
+        .post(&cfg.idol_url)
+        .set("User-Agent", UA)
+        .set("Content-Type", "application/json; charset=utf-8")
+        .set("Accept", "application/json")
+        // bez Referer / Origin mapy odpovídá 400
+        .set("Referer", "https://mpvnet.cz/idol/map")
+        .set("Origin", "https://mpvnet.cz")
+        .set("Accept-Encoding", "gzip")
+        .send_string(body)
+        .map_err(|e| e.to_string())?;
+    let gz = resp.header("Content-Encoding").map_or(false, |v| v.to_ascii_lowercase().contains("gzip"));
+    let body = read_body(resp)?;
+    let body = if gz || body.starts_with(&[0x1f, 0x8b]) { inflate::gunzip(&body, 16 << 20)? } else { body };
+    String::from_utf8(body).map_err(|e| e.to_string())
+}
+
+fn idol_poller(sh: Arc<Shared>) {
+    let cfg = sh.cfg;
+    let agent = make_agent(Duration::from_secs(15), 3);
+    while !sh.stop.is_set() {
+        let t0 = now();
+        match idol_fetch(&agent, cfg).and_then(|src| idol::parse(&src, (now() * 1000.0) as i64)) {
+            Ok(snap) => {
+                let t = now();
+                let mut g = lock(&sh.idol);
+                g.vehicles = snap.vehicles.len();
+                g.list = snap.vehicles;
+                g.payload = Arc::from(snap.raw);
+                g.list_ts = t;
+                g.last_ok = t;
+                g.failures = 0;
+                g.last_error.clear();
+                g.last_fetch_ms = ((t - t0) * 1000.0) as u64;
+            }
+            Err(e) => {
+                let mut g = lock(&sh.idol);
+                g.failures += 1;
+                g.last_error = e.clone();
+                let n = g.failures;
+                if n == 1 || n == 6 || n % 60 == 0 {
+                    warn!("IDOL selhal ({}x): {}", n, e);
+                }
+            }
+        }
+        if sh.stop.wait(Duration::from_secs_f64((cfg.idol_poll_s - (now() - t0)).max(0.0))) {
+            break;
+        }
+    }
+}
+
+/// Poslední odpověď IDOL a její stáří; starší než IDOL_HOLD_S (nebo vypnuté / ještě žádná) = prázdná.
+fn idol_body(sh: &Shared) -> (Arc<[u8]>, Option<f64>) {
+    let empty: Arc<[u8]> = Arc::from(IDOL_EMPTY);
+    if !sh.cfg.idol_enabled {
+        return (empty, None);
+    }
+    let (last, body) = {
+        let g = lock(&sh.idol);
+        (g.last_ok, g.payload.clone())
+    };
+    if last == 0.0 {
+        return (empty, None);
+    }
+    let age = now() - last;
+    (if age <= sh.cfg.idol_hold_s { body } else { empty }, Some(age))
+}
+
+// ---------------------------------------------------------------- DPKV (Karlovy Vary)
+
+const DPKV_EMPTY: &[u8] = b"{\"vehicles\":[]}";
+
+/// Polohy (GetFeatures, JSON) a tabulka právě jedoucích spojů (HTML) z dopravního portálu DPKV.
+fn dpkv_fetch(agent: &ureq::Agent, cfg: &Config) -> Result<(String, String), String> {
+    let referer = format!("{}/", cfg.dpkv_base);
+    // výřez celé ČR v S-JTSK (EPSG:5514): portál vrací všechny své vozy, nic se neořezává
+    let body = r#"{"scale":40000,"resolution":10.58,"extent":{"xmin":-910000,"xmax":-430000,"ymin":-1230000,"ymax":-930000},"layerFilterList":[{"id":"RT spoje point"}]}"#;
+    let read = |resp: ureq::Response| -> Result<String, String> {
+        let gz = resp.header("Content-Encoding").map_or(false, |v| v.to_ascii_lowercase().contains("gzip"));
+        let b = read_body(resp)?;
+        let b = if gz || b.starts_with(&[0x1f, 0x8b]) { inflate::gunzip(&b, 16 << 20)? } else { b };
+        String::from_utf8(b).map_err(|e| e.to_string())
+    };
+    let features = agent
+        .post(&format!("{}/FeatureService/GetFeatures", cfg.dpkv_base))
+        .set("User-Agent", UA)
+        .set("Content-Type", "application/json; charset=utf-8")
+        .set("Referer", &referer)
+        .set("Accept-Encoding", "gzip")
+        .send_string(body)
+        .map_err(|e| e.to_string())
+        .and_then(read)?;
+    let table = agent
+        .get(&format!("{}/TabularData/RTConn?order=undefined&dir=undefined", cfg.dpkv_base))
+        .set("User-Agent", UA)
+        .set("Referer", &referer)
+        .set("Accept-Encoding", "gzip")
+        .call()
+        .map_err(|e| e.to_string())
+        .and_then(read)?;
+    Ok((features, table))
+}
+
+fn dpkv_poller(sh: Arc<Shared>) {
+    let cfg = sh.cfg;
+    let agent = make_agent(Duration::from_secs(15), 3);
+    while !sh.stop.is_set() {
+        let t0 = now();
+        match dpkv_fetch(&agent, cfg).and_then(|(f, t)| dpkv::parse(&f, &t)) {
+            Ok(snap) => {
+                let t = now();
+                let mut g = lock(&sh.dpkv);
+                g.vehicles = snap.vehicles.len();
+                g.list = snap.vehicles;
+                g.payload = Arc::from(snap.raw);
+                g.list_ts = t;
+                g.last_ok = t;
+                g.failures = 0;
+                g.last_error.clear();
+                g.last_fetch_ms = ((t - t0) * 1000.0) as u64;
+            }
+            Err(e) => {
+                let mut g = lock(&sh.dpkv);
+                g.failures += 1;
+                g.last_error = e.clone();
+                let n = g.failures;
+                if n == 1 || n == 6 || n % 60 == 0 {
+                    warn!("DPKV selhal ({}x): {}", n, e);
+                }
+            }
+        }
+        if sh.stop.wait(Duration::from_secs_f64((cfg.dpkv_poll_s - (now() - t0)).max(0.0))) {
+            break;
+        }
+    }
+}
+
+fn dpkv_body(sh: &Shared) -> (Arc<[u8]>, Option<f64>) {
+    let empty: Arc<[u8]> = Arc::from(DPKV_EMPTY);
+    if !sh.cfg.dpkv_enabled {
+        return (empty, None);
+    }
+    let (last, body) = {
+        let g = lock(&sh.dpkv);
+        (g.last_ok, g.payload.clone())
+    };
+    if last == 0.0 {
+        return (empty, None);
+    }
+    let age = now() - last;
+    (if age <= sh.cfg.dpkv_hold_s { body } else { empty }, Some(age))
+}
+
 // ---------------------------------------------------------------- DPMD (Děčín)
 
 const DPMD_EMPTY: &[u8] = b"{\"TimeStamp\":null,\"buspositions\":[]}";
@@ -867,6 +1065,51 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
         });
     }
 
+    // IDOL (Liberecký kraj): autobusy mají vlastní identitu (evidenční číslo), s jinými zdroji se neslučují a nezahazují
+    // se jako "duchové"; prázdné segments = nemaskuje zastaralé vozy jiných zdrojů. Vlaky se slučují podle čísla.
+    if cfg.idol_enabled {
+        let g = lock(&sh.idol);
+        let held_s = (t - g.list_ts).floor() as i64;
+        let vehicles: Vec<Vehicle> = if g.list_ts > 0.0 && held_s <= 60 {
+            g.list.iter().map(|v| Vehicle { age_sec: v.age_sec + held_s, ..v.clone() }).collect()
+        } else {
+            Vec::new()
+        };
+        inputs.push(SourceInput {
+            id: "idol",
+            name: "IDOL",
+            segments: &[],
+            health: merge::health_of(g.last_ok, t, 60.0),
+            stale_vehicle_sec: 90,
+            vehicles,
+            held: 0,
+            failures: g.failures,
+            last_error: g.last_error.clone(),
+        });
+    }
+
+    // DPKV (Karlovy Vary): vlastní číslování, nikdo jiný tam nejezdí; jako DPMD se neslučuje, nemaskuje a nemaže
+    if cfg.dpkv_enabled {
+        let g = lock(&sh.dpkv);
+        let held_s = (t - g.list_ts).floor() as i64;
+        let vehicles: Vec<Vehicle> = if g.list_ts > 0.0 && held_s <= 60 {
+            g.list.iter().map(|v| Vehicle { age_sec: v.age_sec + held_s, ..v.clone() }).collect()
+        } else {
+            Vec::new()
+        };
+        inputs.push(SourceInput {
+            id: "dpkv",
+            name: "DPKV",
+            segments: &[],
+            health: merge::health_of(g.last_ok, t, 60.0),
+            stale_vehicle_sec: 90,
+            vehicles,
+            held: 0,
+            failures: g.failures,
+            last_error: g.last_error.clone(),
+        });
+    }
+
     // DÚK: držená vozidla z feedu (stáří = stáří GPS při pozorování + jak dlouho ji držíme)
     let (duk_outage, duk_last_ok) = {
         let g = lock(&sh.duk);
@@ -1007,6 +1250,20 @@ fn health(sh: &Shared) -> Arc<[u8]> {
                "vehicles": g.vehicles, "lastFetchMs": g.last_fetch_ms,
                "ok": ok(a), "upstreamAgeSec": a.map(|a| a as i64)})
     };
+    let idol = {
+        let g = lock(&sh.idol);
+        let a = age(g.last_ok);
+        json!({"enabled": sh.cfg.idol_enabled, "lastOk": g.last_ok, "failures": g.failures, "lastError": g.last_error,
+               "vehicles": g.vehicles, "lastFetchMs": g.last_fetch_ms,
+               "ok": ok(a), "upstreamAgeSec": a.map(|a| a as i64)})
+    };
+    let dpkv = {
+        let g = lock(&sh.dpkv);
+        let a = age(g.last_ok);
+        json!({"enabled": sh.cfg.dpkv_enabled, "lastOk": g.last_ok, "failures": g.failures, "lastError": g.last_error,
+               "vehicles": g.vehicles, "lastFetchMs": g.last_fetch_ms,
+               "ok": ok(a), "upstreamAgeSec": a.map(|a| a as i64)})
+    };
     let pid = {
         let g = lock(&sh.pid);
         let a = age(g.last_ok);
@@ -1020,7 +1277,7 @@ fn health(sh: &Shared) -> Arc<[u8]> {
     // SŽ se do souhrnného "ok" nepočítá: její 403 nesmí shodit zdraví celého serveru
     let body = json!({"ok": duk_ok && dpmul_ok,
                       "uptimeMs": sh.start.elapsed().as_millis() as u64,
-                      "duk": duk, "dpmul": dpmul, "sz": sz, "dpmd": dpmd, "pid": pid,
+                      "duk": duk, "dpmul": dpmul, "sz": sz, "dpmd": dpmd, "idol": idol, "dpkv": dpkv, "pid": pid,
                       "rateLimit": {"enabled": sh.limiter.is_some(), "perMin": sh.cfg.rate_per_min,
                                     "burst": sh.cfg.rate_burst,
                                     "limitedTotal": sh.limiter.as_ref().map_or(0, |l| l.limited_total())}});
@@ -1097,6 +1354,8 @@ fn handle(rq: tiny_http::Request, sh: &Shared) {
                     "/api/raw/dpmul": "DPMÚL, poslední odpověď",
                     "/api/raw/sz": "Správa železnic, poslední odpověď",
                     "/api/raw/dpmd": "DPMD (Děčín), vozidla ve službě bez řidičů",
+                    "/api/raw/idol": "IDOL (Liberecký kraj), vozidla z mapy mpvnet.cz",
+                    "/api/raw/dpkv": "DPKV (Karlovy Vary), rozebraná vozidla (WGS84)",
                     "/api/raw/pid": "PID (Golemio), rozebraná vozidla, jedno na oběh",
                     "/api/health": "stav serveru a zdrojů"
                 }
@@ -1117,6 +1376,16 @@ fn handle(rq: tiny_http::Request, sh: &Shared) {
         }
         "/api/raw/dpmd" => {
             let (b, age) = dpmd_body(sh);
+            x_age = Some(age.map_or(-1, |a| a as i64));
+            b
+        }
+        "/api/raw/idol" => {
+            let (b, age) = idol_body(sh);
+            x_age = Some(age.map_or(-1, |a| a as i64));
+            b
+        }
+        "/api/raw/dpkv" => {
+            let (b, age) = dpkv_body(sh);
             x_age = Some(age.map_or(-1, |a| a as i64));
             b
         }
@@ -1207,6 +1476,26 @@ fn main() {
             vehicles: 0,
             last_fetch_ms: 0,
         }),
+        idol: Mutex::new(Idol {
+            payload: Arc::from(IDOL_EMPTY),
+            list: Vec::new(),
+            list_ts: 0.0,
+            last_ok: 0.0,
+            failures: 0,
+            last_error: String::new(),
+            vehicles: 0,
+            last_fetch_ms: 0,
+        }),
+        dpkv: Mutex::new(Idol {
+            payload: Arc::from(DPKV_EMPTY),
+            list: Vec::new(),
+            list_ts: 0.0,
+            last_ok: 0.0,
+            failures: 0,
+            last_error: String::new(),
+            vehicles: 0,
+            last_fetch_ms: 0,
+        }),
         pid: Mutex::new(Pid {
             list: Vec::new(),
             list_ts: 0.0,
@@ -1244,6 +1533,14 @@ fn main() {
         if cfg.dpmd_enabled {
             let s = sh.clone();
             small("dpmd").spawn(move || dpmd_poller(s)).unwrap();
+        }
+        if cfg.idol_enabled {
+            let s = sh.clone();
+            small("idol").spawn(move || idol_poller(s)).unwrap();
+        }
+        if cfg.dpkv_enabled {
+            let s = sh.clone();
+            small("dpkv").spawn(move || dpkv_poller(s)).unwrap();
         }
         if cfg.pid_enabled {
             let s = sh.clone();

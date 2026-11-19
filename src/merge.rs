@@ -561,7 +561,12 @@ fn train_no(v: &Vehicle) -> String {
 fn same_vehicle(a: &Vehicle, b: &Vehicle) -> bool {
     // Děčínské vozy (DPMD) mají vlastní číslování, které se s ústeckým překrývá (834 je v obou městech)
     // a žádný jiný zdroj je nezná: nikdy se neslučují s ničím jiným.
-    if a.source == "dpmd" || b.source == "dpmd" {
+    if a.source == "dpmd" || b.source == "dpmd" || a.source == "dpkv" || b.source == "dpkv" {
+        return false;
+    }
+    // IDOL (Liberecký kraj): autobusy mají vlastní identitu (evidenční číslo) a v Libereckém kraji jiný zdroj nejezdí,
+    // neslučují se; vlaky IDOL se párují s ostatními podle čísla vlaku níž.
+    if (a.source == "idol" && !a.train) || (b.source == "idol" && !b.train) {
         return false;
     }
     // PID číslo vozu je z jiné číselné řady než DÚK (a mezi druhy dopravy se opakuje): u autobusů se s jiným zdrojem
@@ -709,6 +714,8 @@ pub fn fuse(inputs: &[SourceInput]) -> Vec<Vehicle> {
             // vozidel (vlak / autobus) právě čerstvě pokrývá a vůz nevidí. DPMD (vlastní číslování, nikdo jiný tam nejezdí)
             // se nezahazuje nikdy.
             let ghost = v.source != "dpmd"
+                && v.source != "dpkv"
+                && !(v.source == "idol" && !v.train)
                 && match ordered.iter().find(|i| i.id == v.source) {
                     Some(own) => {
                         v.age_sec > own.stale_vehicle_sec
@@ -743,8 +750,14 @@ pub fn uid_of(v: &Vehicle) -> String {
     if v.source == "dpmd" && v.id != 0 {
         return format!("d{}", v.id); // vlastní číselná řada, nesmí splynout s "v834" z Ústí
     }
+    if v.source == "dpkv" && v.id != 0 {
+        return format!("k{}", v.id); // Karlovy Vary: vlastní číselná řada
+    }
     if v.train && !v.cis.is_empty() {
         return format!("t{}", v.cis.trim().trim_start_matches('0'));
+    }
+    if v.source == "idol" && !v.vkey.is_empty() {
+        return format!("l{}", v.vkey); // IDOL: evidenční číslo vozu, vlastní řada
     }
     if v.source == "pid" && !v.vkey.is_empty() {
         return format!("g{}", v.vkey); // PID: číslo vozu platí jen v rámci druhu dopravy, nesmí splynout s "v451" z Ústí

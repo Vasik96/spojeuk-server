@@ -18,6 +18,9 @@
 //! DPKV (Karlovy Vary): městské autobusy z dopravního portálu dopravniportal.dpkv.cz (souřadnice S-JTSK se převádějí
 //! na WGS84), viz dpkv.rs.
 //!
+//! PMDP (Plzeň): tramvaje, trolejbusy a autobusy z mapy jizdnirady.pmdp.cz/provoz přes SignalR (longPolling),
+//! viz pmdp.rs a pmdp_session.
+//!
 //! PID (Golemio): všechny druhy dopravy PID včetně vlaků v oblasti PID. Zapíná se klíčem GOLEMIO_API_KEY (bez něj se
 //! kanál nedotazuje). Vlaky PID se sloučí s vlaky SŽ (a DÚK) podle čísla vlaku, viz pid.rs a merge.rs.
 //!
@@ -25,7 +28,7 @@
 //!   GET /duk/traffic, /dpmul/traffic, /health          původní (zůstávají kvůli Android appce a webu)
 //!   GET /api/                                          přehled API v2
 //!   GET /api/vehicles                                  všechna vozidla sloučená ze zdrojů (nejčerstvější poloha)
-//!   GET /api/raw/duk | /api/raw/dpmul | /api/raw/sz | /api/raw/dpmd | /api/raw/idol | /api/raw/dpkv   jednotlivé zdroje
+//!   GET /api/raw/duk | /api/raw/dpmul | /api/raw/sz | /api/raw/dpmd | /api/raw/idol | /api/raw/dpkv | /api/raw/pmdp   jednotlivé zdroje
 //!   GET /api/raw/pid                                   PID: už rozebraná vozidla (Golemio je velké, surové se nedrží)
 //!   GET /api/health                                    totéž co /health
 //!
@@ -36,6 +39,7 @@
 
 mod dpkv;
 mod dpmd;
+mod pmdp;
 mod idol;
 mod inflate;
 mod jsl;
@@ -101,6 +105,9 @@ struct Config {
     dpkv_base: String,
     dpkv_poll_s: f64,
     dpkv_hold_s: f64,
+    pmdp_enabled: bool,
+    pmdp_base: String,
+    pmdp_hold_s: f64,
     pid_enabled: bool,
     pid_url: String,
     /// tajemství: nikdy se nelogguje ani nevypisuje
@@ -186,6 +193,9 @@ impl Config {
             dpkv_base: env_str("DPKV_BASE", "https://dopravniportal.dpkv.cz/dic"),
             dpkv_poll_s: env_f("DPKV_POLL_S", 10.0).max(5.0),
             dpkv_hold_s: env_f("DPKV_HOLD_S", 120.0),
+            pmdp_enabled: env_str("PMDP", "1") != "0",
+            pmdp_base: env_str("PMDP_BASE", "https://jizdnirady.pmdp.cz"),
+            pmdp_hold_s: env_f("PMDP_HOLD_S", 120.0),
             pid_key: env_str("GOLEMIO_API_KEY", "").trim().to_string(),
             pid_enabled: env_str("PID", "1") != "0" && !env_str("GOLEMIO_API_KEY", "").trim().is_empty(),
             pid_url: env_str("PID_URL", "https://api.golemio.cz/v2/vehiclepositions?limit=10000&includeNotTracking=true"),
@@ -321,6 +331,7 @@ struct Shared {
     dpmd: Mutex<Dpmd>,
     idol: Mutex<Idol>,
     dpkv: Mutex<Idol>, // stejný stav jako IDOL (poslední seznam, raw JSON, chyby)
+    pmdp: Mutex<Idol>,
     pid: Mutex<Pid>,
     vcache: Mutex<(f64, Arc<[u8]>)>, // sestavený /api/vehicles a kdy
     limiter: Option<RateLimiter>,
@@ -842,6 +853,129 @@ fn dpkv_body(sh: &Shared) -> (Arc<[u8]>, Option<f64>) {
     (if age <= sh.cfg.dpkv_hold_s { body } else { empty }, Some(age))
 }
 
+// ---------------------------------------------------------------- PMDP (Plzeň), SignalR longPolling
+
+const PMDP_EMPTY: &[u8] = b"{\"vehicles\":[]}";
+
+/// Procentové kódování pro query string a formulář (vše kromě nerezervovaných znaků).
+fn urlenc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+/// Jedno spojení se SignalR hubem PMDP: negotiate → connect → start → registrace(null) → poll ve smyčce.
+/// Vrátí se při zastavení serveru, jinak chybou (odpojení, výpadek, dlouho bez dat) a poller se připojí znovu.
+fn pmdp_session(agent: &ureq::Agent, sh: &Shared) -> Result<(), String> {
+    let base = &sh.cfg.pmdp_base;
+    let referer = format!("{}/provoz", base);
+    let cd = urlenc(r#"[{"name":"provozhub"}]"#);
+    let call = |url: &str, form: Option<&str>| -> Result<serde_json::Value, String> {
+        let req = if form.is_some() { agent.post(url) } else { agent.get(url) };
+        let req = req.set("User-Agent", UA).set("Referer", &referer);
+        let resp = match form {
+            Some(b) => req.set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8").send_string(b),
+            None => req.call(),
+        }
+        .map_err(|e| e.to_string())?;
+        let body = read_body(resp)?;
+        serde_json::from_slice(&body).map_err(|e| format!("JSON: {e}"))
+    };
+    let neg = call(&format!("{base}/signalr/negotiate?clientProtocol=1.5&connectionData={cd}"), None)?;
+    let token = neg.get("ConnectionToken").and_then(|v| v.as_str()).ok_or("negotiate bez ConnectionToken")?;
+    let q = format!("transport=longPolling&clientProtocol=1.5&connectionToken={}&connectionData={}", urlenc(token), cd);
+    let c = call(&format!("{base}/signalr/connect?{q}"), Some(""))?;
+    let mut mid = c.get("C").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    call(&format!("{base}/signalr/start?{q}"), None)?;
+    // null = všechny linky (jako mapa bez výběru linek)
+    let msg = r#"{"H":"provozhub","M":"registrace","A":[null],"I":0}"#;
+    call(&format!("{base}/signalr/send?{q}"), Some(&format!("data={}", urlenc(msg))))?;
+    let mut last_update = now();
+    loop {
+        if sh.stop.is_set() {
+            return Ok(());
+        }
+        let r = call(&format!("{base}/signalr/poll?{q}&messageId={}", urlenc(&mid)), Some(""))?;
+        let t = now();
+        {
+            let mut g = lock(&sh.pmdp);
+            g.last_ok = t;
+            g.failures = 0;
+            g.last_error.clear();
+        }
+        // D = server spojení ukončil, T = klient se má připojit znovu
+        if r.get("D").and_then(|v| v.as_i64()) == Some(1) || r.get("T").and_then(|v| v.as_i64()) == Some(1) {
+            return Err("server požádal o nové spojení".into());
+        }
+        if let Some(c) = r.get("C").and_then(|v| v.as_str()) {
+            mid = c.to_string();
+        }
+        for m in r.get("M").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]) {
+            if m.get("M").and_then(|v| v.as_str()) != Some("updateTraffic") {
+                continue;
+            }
+            if let Some(list) = m.get("A").and_then(|a| a.get(0)).and_then(|l| l.as_array()) {
+                let vs = pmdp::parse_traffic(list, (t * 1000.0) as i64);
+                let raw = serde_json::to_vec(&json!({ "vehicles": vs })).unwrap_or_default();
+                let mut g = lock(&sh.pmdp);
+                g.vehicles = vs.len();
+                g.list = vs;
+                g.payload = Arc::from(raw);
+                g.list_ts = t;
+                last_update = t;
+            }
+        }
+        // stav chodí po 2–8 s; dlouho nic = spojení se zaseklo, připojit znovu
+        if t - last_update > 90.0 {
+            return Err("90 s bez updateTraffic".into());
+        }
+    }
+}
+
+fn pmdp_poller(sh: Arc<Shared>) {
+    // long poll drží spojení až ~110 s (ConnectionTimeout serveru)
+    let agent = make_agent(Duration::from_secs(130), 3);
+    while !sh.stop.is_set() {
+        if let Err(e) = pmdp_session(&agent, &sh) {
+            let n = {
+                let mut g = lock(&sh.pmdp);
+                g.failures += 1;
+                g.last_error = e.clone();
+                g.failures
+            };
+            if n == 1 || n == 6 || n % 60 == 0 {
+                warn!("PMDP selhal ({}x): {}", n, e);
+            }
+            let pause = (5 * n).min(60) as f64;
+            if sh.stop.wait(Duration::from_secs_f64(pause)) {
+                break;
+            }
+        }
+    }
+}
+
+fn pmdp_body(sh: &Shared) -> (Arc<[u8]>, Option<f64>) {
+    let empty: Arc<[u8]> = Arc::from(PMDP_EMPTY);
+    if !sh.cfg.pmdp_enabled {
+        return (empty, None);
+    }
+    let (last, body) = {
+        let g = lock(&sh.pmdp);
+        (g.list_ts, g.payload.clone())
+    };
+    if last == 0.0 {
+        return (empty, None);
+    }
+    let age = now() - last;
+    (if age <= sh.cfg.pmdp_hold_s { body } else { empty }, Some(age))
+}
+
 // ---------------------------------------------------------------- DPMD (Děčín)
 
 const DPMD_EMPTY: &[u8] = b"{\"TimeStamp\":null,\"buspositions\":[]}";
@@ -1110,6 +1244,28 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
         });
     }
 
+    // PMDP (Plzeň): vlastní číslování, nikdo jiný tam nejezdí; neslučuje se, nemaskuje a nemaže
+    if cfg.pmdp_enabled {
+        let g = lock(&sh.pmdp);
+        let held_s = (t - g.list_ts).floor() as i64;
+        let vehicles: Vec<Vehicle> = if g.list_ts > 0.0 && held_s <= 60 {
+            g.list.iter().map(|v| Vehicle { age_sec: v.age_sec + held_s, ..v.clone() }).collect()
+        } else {
+            Vec::new()
+        };
+        inputs.push(SourceInput {
+            id: "pmdp",
+            name: "PMDP",
+            segments: &[],
+            health: merge::health_of(g.list_ts, t, 60.0),
+            stale_vehicle_sec: 90,
+            vehicles,
+            held: 0,
+            failures: g.failures,
+            last_error: g.last_error.clone(),
+        });
+    }
+
     // DÚK: držená vozidla z feedu (stáří = stáří GPS při pozorování + jak dlouho ji držíme)
     let (duk_outage, duk_last_ok) = {
         let g = lock(&sh.duk);
@@ -1264,6 +1420,12 @@ fn health(sh: &Shared) -> Arc<[u8]> {
                "vehicles": g.vehicles, "lastFetchMs": g.last_fetch_ms,
                "ok": ok(a), "upstreamAgeSec": a.map(|a| a as i64)})
     };
+    let pmdp = {
+        let g = lock(&sh.pmdp);
+        let a = age(g.list_ts);
+        json!({"enabled": sh.cfg.pmdp_enabled, "lastOk": g.last_ok, "lastUpdate": g.list_ts, "failures": g.failures,
+               "lastError": g.last_error, "vehicles": g.vehicles, "ok": ok(a), "upstreamAgeSec": a.map(|a| a as i64)})
+    };
     let pid = {
         let g = lock(&sh.pid);
         let a = age(g.last_ok);
@@ -1277,7 +1439,7 @@ fn health(sh: &Shared) -> Arc<[u8]> {
     // SŽ se do souhrnného "ok" nepočítá: její 403 nesmí shodit zdraví celého serveru
     let body = json!({"ok": duk_ok && dpmul_ok,
                       "uptimeMs": sh.start.elapsed().as_millis() as u64,
-                      "duk": duk, "dpmul": dpmul, "sz": sz, "dpmd": dpmd, "idol": idol, "dpkv": dpkv, "pid": pid,
+                      "duk": duk, "dpmul": dpmul, "sz": sz, "dpmd": dpmd, "idol": idol, "dpkv": dpkv, "pmdp": pmdp, "pid": pid,
                       "rateLimit": {"enabled": sh.limiter.is_some(), "perMin": sh.cfg.rate_per_min,
                                     "burst": sh.cfg.rate_burst,
                                     "limitedTotal": sh.limiter.as_ref().map_or(0, |l| l.limited_total())}});
@@ -1356,6 +1518,7 @@ fn handle(rq: tiny_http::Request, sh: &Shared) {
                     "/api/raw/dpmd": "DPMD (Děčín), vozidla ve službě bez řidičů",
                     "/api/raw/idol": "IDOL (Liberecký kraj), vozidla z mapy mpvnet.cz",
                     "/api/raw/dpkv": "DPKV (Karlovy Vary), rozebraná vozidla (WGS84)",
+                    "/api/raw/pmdp": "PMDP (Plzeň), rozebraná vozidla (tramvaje, trolejbusy, autobusy)",
                     "/api/raw/pid": "PID (Golemio), rozebraná vozidla, jedno na oběh",
                     "/api/health": "stav serveru a zdrojů"
                 }
@@ -1386,6 +1549,11 @@ fn handle(rq: tiny_http::Request, sh: &Shared) {
         }
         "/api/raw/dpkv" => {
             let (b, age) = dpkv_body(sh);
+            x_age = Some(age.map_or(-1, |a| a as i64));
+            b
+        }
+        "/api/raw/pmdp" => {
+            let (b, age) = pmdp_body(sh);
             x_age = Some(age.map_or(-1, |a| a as i64));
             b
         }
@@ -1496,6 +1664,16 @@ fn main() {
             vehicles: 0,
             last_fetch_ms: 0,
         }),
+        pmdp: Mutex::new(Idol {
+            payload: Arc::from(PMDP_EMPTY),
+            list: Vec::new(),
+            list_ts: 0.0,
+            last_ok: 0.0,
+            failures: 0,
+            last_error: String::new(),
+            vehicles: 0,
+            last_fetch_ms: 0,
+        }),
         pid: Mutex::new(Pid {
             list: Vec::new(),
             list_ts: 0.0,
@@ -1541,6 +1719,10 @@ fn main() {
         if cfg.dpkv_enabled {
             let s = sh.clone();
             small("dpkv").spawn(move || dpkv_poller(s)).unwrap();
+        }
+        if cfg.pmdp_enabled {
+            let s = sh.clone();
+            small("pmdp").spawn(move || pmdp_poller(s)).unwrap();
         }
         if cfg.pid_enabled {
             let s = sh.clone();

@@ -561,7 +561,8 @@ fn train_no(v: &Vehicle) -> String {
 fn same_vehicle(a: &Vehicle, b: &Vehicle) -> bool {
     // Děčínské vozy (DPMD) mají vlastní číslování, které se s ústeckým překrývá (834 je v obou městech)
     // a žádný jiný zdroj je nezná: nikdy se neslučují s ničím jiným.
-    if a.source == "dpmd" || b.source == "dpmd" || a.source == "dpkv" || b.source == "dpkv" {
+    let own_city = |v: &Vehicle| matches!(v.source.as_str(), "dpmd" | "dpkv" | "pmdp");
+    if own_city(a) || own_city(b) {
         return false;
     }
     // IDOL (Liberecký kraj): autobusy mají vlastní identitu (evidenční číslo) a v Libereckém kraji jiný zdroj nejezdí,
@@ -715,6 +716,7 @@ pub fn fuse(inputs: &[SourceInput]) -> Vec<Vehicle> {
             // se nezahazuje nikdy.
             let ghost = v.source != "dpmd"
                 && v.source != "dpkv"
+                && v.source != "pmdp"
                 && !(v.source == "idol" && !v.train)
                 && match ordered.iter().find(|i| i.id == v.source) {
                     Some(own) => {
@@ -752,6 +754,9 @@ pub fn uid_of(v: &Vehicle) -> String {
     }
     if v.source == "dpkv" && v.id != 0 {
         return format!("k{}", v.id); // Karlovy Vary: vlastní číselná řada
+    }
+    if v.source == "pmdp" && v.id != 0 {
+        return format!("z{}", v.id); // Plzeň: vlastní číselná řada
     }
     if v.train && !v.cis.is_empty() {
         return format!("t{}", v.cis.trim().trim_start_matches('0'));

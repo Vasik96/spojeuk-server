@@ -332,6 +332,7 @@ struct Shared {
     idol: Mutex<Idol>,
     dpkv: Mutex<Idol>, // stejný stav jako IDOL (poslední seznam, raw JSON, chyby)
     pmdp: Mutex<Idol>,
+    pmdp_api: Mutex<PmdpApi>,
     pid: Mutex<Pid>,
     vcache: Mutex<(f64, Arc<[u8]>)>, // sestavený /api/vehicles a kdy
     limiter: Option<RateLimiter>,
@@ -960,6 +961,107 @@ fn pmdp_poller(sh: Arc<Shared>) {
     }
 }
 
+/// Relace webu PMDP pro dotazy na trasu spoje (token ze stránky /provoz + cookie ASP.NET) a cache tras.
+struct PmdpApi {
+    token: String,
+    cookie: String,
+    token_at: f64,
+    /// ConnectionId → (kdy, odpověď {"trip": …})
+    trips: HashMap<String, (f64, Arc<[u8]>)>,
+}
+
+const PMDP_TRIP_TTL_S: f64 = 600.0;
+const PMDP_TOKEN_TTL_S: f64 = 1800.0;
+
+fn pmdp_agent() -> &'static ureq::Agent {
+    static A: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    A.get_or_init(|| make_agent(Duration::from_secs(12), 3))
+}
+
+/// Nová relace: stránka /provoz → token z hidden pole + cookies.
+fn pmdp_new_session(base: &str) -> Result<(String, String), String> {
+    let resp = pmdp_agent().get(&format!("{base}/provoz")).set("User-Agent", UA).call().map_err(|e| e.to_string())?;
+    let cookie = resp
+        .all("set-cookie")
+        .iter()
+        .filter_map(|c| c.split(';').next().map(|x| x.trim().to_string()))
+        .filter(|c| c.contains('='))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let html = String::from_utf8_lossy(&read_body(resp)?).into_owned();
+    let key = "name='X-API-Request-Verification-Token' value='";
+    let i = html.find(key).ok_or("token na stránce není")? + key.len();
+    let j = html[i..].find('\'').ok_or("token bez konce")? + i;
+    Ok((html[i..j].to_string(), cookie))
+}
+
+fn pmdp_fetch_trip(sh: &Shared, conn: &str, token: &str, cookie: &str) -> Result<serde_json::Value, String> {
+    let base = &sh.cfg.pmdp_base;
+    let body = format!(r#"{{"SegmentId":{{"ConnectionId":{conn}}},"IncludeDetailedPath":true}}"#);
+    let resp = pmdp_agent()
+        .post(&format!("{base}/provoz/trasaspoje"))
+        .set("User-Agent", UA)
+        .set("Referer", &format!("{base}/provoz"))
+        .set("Content-Type", "application/json; charset=UTF-8")
+        .set("X-Requested-With", "XMLHttpRequest")
+        .set("X-API-Request-Verification-Token", token)
+        .set("Cookie", cookie)
+        .send_string(&body)
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_slice(&read_body(resp)?).map_err(|e| format!("JSON: {e}"))?;
+    pmdp::parse_path(&v)
+}
+
+/// /api/trip/pmdp?conn=<ConnectionId>: zastávky a tvar trasy spoje PMDP ve tvaru /api/vehicle-trip webu.
+fn pmdp_trip(sh: &Shared, conn: &str) -> Result<Arc<[u8]>, (u16, String)> {
+    if !sh.cfg.pmdp_enabled {
+        return Err((404, "PMDP vypnuto".into()));
+    }
+    let ok_id = !conn.is_empty() && conn.len() <= 14 && conn.trim_start_matches('-').bytes().all(|b| b.is_ascii_digit());
+    if !ok_id || conn.trim_start_matches('-').is_empty() {
+        return Err((400, "conn musí být číslo spoje (ConnectionId)".into()));
+    }
+    let t = now();
+    let (mut token, mut cookie) = {
+        let g = lock(&sh.pmdp_api);
+        if let Some((at, b)) = g.trips.get(conn) {
+            if t - at < PMDP_TRIP_TTL_S {
+                return Ok(b.clone());
+            }
+        }
+        let fresh = !g.token.is_empty() && t - g.token_at < PMDP_TOKEN_TTL_S;
+        if fresh { (g.token.clone(), g.cookie.clone()) } else { (String::new(), String::new()) }
+    };
+    let mut result = Err(String::new());
+    // nejvýš dva pokusy: s uloženou relací a s novou (vypršelý token / cookie)
+    for attempt in 0..2 {
+        if token.is_empty() || attempt == 1 {
+            let (tk, ck) = pmdp_new_session(&sh.cfg.pmdp_base).map_err(|e| (502, format!("relace PMDP: {e}")))?;
+            let mut g = lock(&sh.pmdp_api);
+            g.token = tk.clone();
+            g.cookie = ck.clone();
+            g.token_at = now();
+            token = tk;
+            cookie = ck;
+        }
+        result = pmdp_fetch_trip(sh, conn, &token, &cookie);
+        if result.is_ok() {
+            break;
+        }
+    }
+    let trip = result.map_err(|e| (502, format!("trasa PMDP: {e}")))?;
+    let body: Arc<[u8]> = Arc::from(serde_json::to_vec(&json!({ "trip": trip })).unwrap_or_default());
+    let mut g = lock(&sh.pmdp_api);
+    if g.trips.len() > 500 {
+        g.trips.retain(|_, (at, _)| t - *at < PMDP_TRIP_TTL_S);
+        if g.trips.len() > 500 {
+            g.trips.clear();
+        }
+    }
+    g.trips.insert(conn.to_string(), (t, body.clone()));
+    Ok(body)
+}
+
 fn pmdp_body(sh: &Shared) -> (Arc<[u8]>, Option<f64>) {
     let empty: Arc<[u8]> = Arc::from(PMDP_EMPTY);
     if !sh.cfg.pmdp_enabled {
@@ -1519,6 +1621,7 @@ fn handle(rq: tiny_http::Request, sh: &Shared) {
                     "/api/raw/idol": "IDOL (Liberecký kraj), vozidla z mapy mpvnet.cz",
                     "/api/raw/dpkv": "DPKV (Karlovy Vary), rozebraná vozidla (WGS84)",
                     "/api/raw/pmdp": "PMDP (Plzeň), rozebraná vozidla (tramvaje, trolejbusy, autobusy)",
+                    "/api/trip/pmdp?conn=<trip vozu>": "PMDP: zastávky a tvar trasy spoje (stejný tvar jako /api/vehicle-trip webu)",
                     "/api/raw/pid": "PID (Golemio), rozebraná vozidla, jedno na oběh",
                     "/api/health": "stav serveru a zdrojů"
                 }
@@ -1551,6 +1654,36 @@ fn handle(rq: tiny_http::Request, sh: &Shared) {
             let (b, age) = dpkv_body(sh);
             x_age = Some(age.map_or(-1, |a| a as i64));
             b
+        }
+        "/api/trip/pmdp" => {
+            let conn = rq
+                .url()
+                .split_once('?')
+                .map(|(_, q)| q)
+                .unwrap_or("")
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("conn="))
+                .unwrap_or("")
+                .to_string();
+            let (status, b, cache) = match pmdp_trip(sh, &conn) {
+                Ok(b) => (200, b, "public, max-age=300"),
+                Err((st, e)) => {
+                    if st >= 500 {
+                        warn!("{}", e);
+                    }
+                    (st, Arc::from(json!({ "error": e }).to_string().into_bytes()), "no-store")
+                }
+            };
+            let len = b.len();
+            let resp = Response::new(
+                StatusCode(status),
+                vec![hdr("Content-Type", "application/json; charset=utf-8"), hdr("Cache-Control", cache)],
+                Cursor::new(b),
+                Some(len),
+                None,
+            );
+            let _ = rq.respond(resp);
+            return;
         }
         "/api/raw/pmdp" => {
             let (b, age) = pmdp_body(sh);
@@ -1674,6 +1807,7 @@ fn main() {
             vehicles: 0,
             last_fetch_ms: 0,
         }),
+        pmdp_api: Mutex::new(PmdpApi { token: String::new(), cookie: String::new(), token_at: 0.0, trips: HashMap::new() }),
         pid: Mutex::new(Pid {
             list: Vec::new(),
             list_ts: 0.0,

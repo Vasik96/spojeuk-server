@@ -1,11 +1,14 @@
-//! spoje-feed: drží poslední známé polohy vozidel z Portabo GetTraffic (DÚK) a z API DPMÚL.
+//! spoje-feed: drží poslední známé polohy vozidel z Portabo GetTraffic (DÚK) a dalších zdrojů.
 //!
 //! DÚK (Portabo): každých POLL_S sekund stáhne feed, zapamatuje si každé použitelné vozidlo (podle ID)
 //! a když vozidlo z feedu zmizí (nebo přijde se State 255 / nulovou polohou), dál ho vrací
 //! s poslední známou polohou, maximálně HOLD_*_S sekund. Výstup je {"VehicleList": [...]} + "_ageSec".
 //!
-//! DPMÚL (Globdata): API je pomalé, tak se dotahuje na pozadí přes trvalé spojení (keep-alive)
-//! a appce se vrací poslední hotová odpověď hned, beze změny.
+//! DPMÚL (MHD Ústí nad Labem): volitelný externí konektor. Zapíná se proměnnou DPMUL_URL (bez ní se kanál
+//! nedotazuje); ta ukazuje na samostatný adaptér, který vrací už hotový formát {"vehicles": [...]} (tvar
+//! merge::Vehicle). Volitelný DPMUL_API_KEY se posílá jako `Authorization: Bearer`. Vozidla jdou do /api/vehicles;
+//! volitelné pole "traffic" (původní odpověď) se beze změny vrací na /dpmul/traffic a /api/raw/dpmul.
+//! Vypnutý nebo neodpovídající konektor = oba vrací [].
 //!
 //! SŽ (Správa železnic): vlaky z mapy SŽ (bez User-Agent, min. 10 s mezi dotazy, 403 = dlouhá pauza).
 //!
@@ -82,7 +85,9 @@ struct Config {
     bind: String,
     port: u16,
     state_file: PathBuf,
+    dpmul_enabled: bool,
     dpmul_url: String,
+    /// tajemství: nikdy se nelogguje ani nevypisuje
     dpmul_api_key: String,
     dpmul_poll_s: f64,
     dpmul_timeout_s: f64,
@@ -160,12 +165,10 @@ impl Config {
             bind: bind.clone(),
             port: env_f("PORT", 8787.0) as u16,
             state_file: PathBuf::from(env_str("STATE_FILE", "/var/lib/spoje-feed/state.json")),
-            dpmul_url: env_str(
-                "DPMUL_URL",
-                "https://dpmxmobappbe.globdata.cz/api/v1/public/Common/skeleton/actual-vehicles",
-            ),
-            // klíč z oficiální aplikace DPMÚL; když se změní, přepsat tady nebo v prostředí
-            dpmul_api_key: env_str("DPMUL_API_KEY", "***REMOVED***"),
+            // externí konektor (např. privátní adaptér na http://127.0.0.1:8788/vehicles); prázdné = vypnuto
+            dpmul_url: env_str("DPMUL_URL", "").trim().to_string(),
+            dpmul_enabled: !env_str("DPMUL_URL", "").trim().is_empty(),
+            dpmul_api_key: env_str("DPMUL_API_KEY", "").trim().to_string(),
             dpmul_poll_s: env_f("DPMUL_POLL_S", 5.0),
             dpmul_timeout_s: env_f("DPMUL_TIMEOUT_S", 30.0),
             dpmul_hold_s: env_f("DPMUL_HOLD_S", 120.0),
@@ -244,10 +247,10 @@ struct Duk {
 }
 
 struct Dpmul {
+    /// pole "traffic" z konektoru beze změny (pro /dpmul/traffic)
     payload: Arc<[u8]>,
     list: Vec<Vehicle>,
     list_ts: f64,
-    stations: HashMap<i64, (f64, f64)>,
     last_ok: f64,
     failures: u64,
     last_error: String,
@@ -535,16 +538,11 @@ fn dpmul_fetch(agent: &ureq::Agent, cfg: &Config) -> Result<Vec<u8>, String> {
     // první pokus může narazit na spojení, které server mezitím zavřel; pak se zkusí nové
     for attempt in 1..=2 {
         let t = Instant::now();
-        let r = agent
-            .post(&cfg.dpmul_url)
-            .set("User-Agent", "Dart/3.12 (dart:io)")
-            .set("Accept", "application/json")
-            .set("Content-Type", "application/json; charset=utf-8")
-            .set("x-app-env", "prod")
-            .set("x-app-version", "2.0.14")
-            .set("dpmxbe-api-key", &cfg.dpmul_api_key)
-            .send_bytes(&[]);
-        match r {
+        let mut req = agent.get(&cfg.dpmul_url).set("User-Agent", UA).set("Accept", "application/json");
+        if !cfg.dpmul_api_key.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", cfg.dpmul_api_key));
+        }
+        match req.call() {
             Ok(resp) => {
                 if resp.status() != 200 {
                     return Err(format!("HTTP {}", resp.status()));
@@ -562,31 +560,44 @@ fn dpmul_fetch(agent: &ureq::Agent, cfg: &Config) -> Result<Vec<u8>, String> {
     Err("nedosažitelné".into())
 }
 
+/// Odpověď konektoru: {"vehicles": [...], "traffic": [...]?} – vozidla ve tvaru merge::Vehicle,
+/// "traffic" (volitelné) je původní odpověď pro /dpmul/traffic a předává se bajt po bajtu.
+#[derive(Deserialize)]
+struct VehicleFeed {
+    vehicles: Vec<Vehicle>,
+    #[serde(default)]
+    traffic: Option<Box<serde_json::value::RawValue>>,
+}
+
 fn dpmul_poller(sh: Arc<Shared>) {
     let cfg = sh.cfg;
     // Agent drží pool spojení (keep-alive), DNS a TLS se neplatí při každém dotazu
     let agent = make_agent(Duration::from_secs_f64(cfg.dpmul_timeout_s), 0);
     while !sh.stop.is_set() {
         let t0 = now();
-        let res = dpmul_fetch(&agent, cfg).and_then(|body| {
-            let v: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
-            match v {
-                Value::Array(a) => Ok((body, a)),
-                _ => Err("odpověď není JSON pole".to_string()),
-            }
-        });
+        let res = dpmul_fetch(&agent, cfg)
+            .and_then(|body| serde_json::from_slice::<VehicleFeed>(&body).map_err(|e| e.to_string()));
         match res {
-            Ok((body, arr)) => {
+            Ok(mut feed) => {
                 let t = now();
+                // zdroj a segment určuje tento server, ne konektor (na nich stojí slučování a uid)
+                let list: Vec<Vehicle> = std::mem::take(&mut feed.vehicles)
+                    .into_iter()
+                    .filter(|v| v.lat.is_finite() && v.lng.is_finite() && v.lat != 0.0 && v.lng != 0.0)
+                    .map(|v| Vehicle { source: "dpmul".into(), segment: "city".into(), city: true, age_sec: v.age_sec.max(0), ..v })
+                    .collect();
+                let traffic: Arc<[u8]> = match &feed.traffic {
+                    Some(r) if r.get().trim_start().starts_with('[') => Arc::from(r.get().as_bytes()),
+                    _ => Arc::from(&b"[]"[..]),
+                };
                 let mut g = lock(&sh.dpmul);
-                let list = merge::parse_dpmul(&arr, (t * 1000.0) as i64, &mut g.stations);
-                g.payload = Arc::from(body);
+                g.payload = traffic;
+                g.vehicles = list.len();
                 g.list = list;
                 g.list_ts = t;
                 g.last_ok = t;
                 g.failures = 0;
                 g.last_error.clear();
-                g.vehicles = arr.len();
                 g.last_fetch_ms = ((t - t0) * 1000.0) as u64;
             }
             Err(e) => {
@@ -595,7 +606,7 @@ fn dpmul_poller(sh: Arc<Shared>) {
                 g.last_error = e.clone();
                 let n = g.failures;
                 if n == 1 || n == 6 || n % 60 == 0 {
-                    warn!("DPMÚL upstream selhal ({}x): {}", n, e);
+                    warn!("DPMÚL konektor selhal ({}x): {}", n, e);
                 }
             }
         }
@@ -605,13 +616,13 @@ fn dpmul_poller(sh: Arc<Shared>) {
     }
 }
 
-/// Poslední odpověď DPMÚL a její stáří; starší než DPMUL_HOLD_S se nevrací.
+/// Poslední "traffic" z konektoru DPMÚL (/dpmul/traffic, /api/raw/dpmul) a jeho stáří; vypnuto, bez dat nebo starší než DPMUL_HOLD_S = [].
 fn dpmul_body(sh: &Shared) -> (Arc<[u8]>, Option<f64>) {
     let (last, body) = {
         let g = lock(&sh.dpmul);
         (g.last_ok, g.payload.clone())
     };
-    if last == 0.0 {
+    if !sh.cfg.dpmul_enabled || last == 0.0 {
         return (Arc::from(&b"[]"[..]), None);
     }
     let age = now() - last;
@@ -1257,7 +1268,7 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
     let mut inputs: Vec<SourceInput> = Vec::with_capacity(5);
 
     // DPMÚL: poslední odpověď se při výpadku drží nejvýš 60 s (stáří poloh roste)
-    {
+    if cfg.dpmul_enabled {
         let g = lock(&sh.dpmul);
         let held_s = (t - g.list_ts).floor() as i64;
         let vehicles: Vec<Vehicle> = if g.list_ts > 0.0 && held_s <= 60 {
@@ -1488,7 +1499,7 @@ fn health(sh: &Shared) -> Arc<[u8]> {
         let g = lock(&sh.dpmul);
         let a = age(g.last_ok);
         (
-            json!({"lastOk": g.last_ok, "failures": g.failures, "lastError": g.last_error,
+            json!({"enabled": sh.cfg.dpmul_enabled, "lastOk": g.last_ok, "failures": g.failures, "lastError": g.last_error,
                    "vehicles": g.vehicles, "lastFetchMs": g.last_fetch_ms,
                    "ok": ok(a), "upstreamAgeSec": a.map(|a| a as i64)}),
             ok(a),
@@ -1539,7 +1550,8 @@ fn health(sh: &Shared) -> Arc<[u8]> {
     // PID se do souhrnného "ok" nepočítá (jako SŽ a DPMD)
     // DPMD se do souhrnného "ok" nepočítá stejně jako SŽ (jeho výpadek nesmí shodit zdraví celého serveru)
     // SŽ se do souhrnného "ok" nepočítá: její 403 nesmí shodit zdraví celého serveru
-    let body = json!({"ok": duk_ok && dpmul_ok,
+    // DPMÚL se počítá jen když je zapnutý (DPMUL_URL); vypnutý nesmí shodit zdraví serveru
+    let body = json!({"ok": duk_ok && (dpmul_ok || !sh.cfg.dpmul_enabled),
                       "uptimeMs": sh.start.elapsed().as_millis() as u64,
                       "duk": duk, "dpmul": dpmul, "sz": sz, "dpmd": dpmd, "idol": idol, "dpkv": dpkv, "pmdp": pmdp, "pid": pid,
                       "rateLimit": {"enabled": sh.limiter.is_some(), "perMin": sh.cfg.rate_per_min,
@@ -1731,7 +1743,6 @@ fn worker(server: Arc<Server>, sh: Arc<Shared>) {
 
 fn main() {
     let cfg: &'static Config = Box::leak(Box::new(Config::from_env()));
-    let empty: Arc<[u8]> = Arc::from(&b"[]"[..]);
     let sh = Arc::new(Shared {
         cfg,
         duk: Mutex::new(Duk {
@@ -1745,10 +1756,9 @@ fn main() {
             held_mhd: 0,
         }),
         dpmul: Mutex::new(Dpmul {
-            payload: empty,
+            payload: Arc::from(&b"[]"[..]),
             list: Vec::new(),
             list_ts: 0.0,
-            stations: HashMap::new(),
             last_ok: 0.0,
             failures: 0,
             last_error: String::new(),
@@ -1836,8 +1846,10 @@ fn main() {
     {
         let s = sh.clone();
         small("duk").spawn(move || poller(s)).unwrap();
-        let s = sh.clone();
-        small("dpmul").spawn(move || dpmul_poller(s)).unwrap();
+        if cfg.dpmul_enabled {
+            let s = sh.clone();
+            small("dpmul").spawn(move || dpmul_poller(s)).unwrap();
+        }
         if cfg.sz_enabled {
             let s = sh.clone();
             small("sz").spawn(move || sz_poller(s)).unwrap();
@@ -1880,7 +1892,7 @@ fn main() {
         "PID (Golemio): {}",
         if cfg.pid_enabled { "zapnuto" } else if cfg.pid_key.is_empty() { "vypnuto (chybí GOLEMIO_API_KEY)" } else { "vypnuto (PID=0)" }
     );
-    info!("poslouchám na {}:{}, upstream DÚK {}, DPMÚL {}, SŽ {}, DPMD {}", cfg.bind, cfg.port, cfg.upstream, cfg.dpmul_url, if cfg.sz_enabled { "zapnuta" } else { "vypnuta" }, if cfg.dpmd_enabled { cfg.dpmd_url.as_str() } else { "vypnut" });
+    info!("poslouchám na {}:{}, upstream DÚK {}, DPMÚL {}, SŽ {}, DPMD {}", cfg.bind, cfg.port, cfg.upstream, if cfg.dpmul_enabled { "zapnut (DPMUL_URL)" } else { "vypnut" }, if cfg.sz_enabled { "zapnuta" } else { "vypnuta" }, if cfg.dpmd_enabled { cfg.dpmd_url.as_str() } else { "vypnut" });
 
     let workers: Vec<_> = (0..HTTP_WORKERS)
         .map(|i| {

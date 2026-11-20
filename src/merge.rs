@@ -1,18 +1,20 @@
-//! Sloučení zdrojů poloh. Port z webu: lib/fusion.mjs, lib/hub.mjs, normalize() z lib/feed.mjs
-//! a parseDpmul() z lib/sources.mjs. Výstup /api/vehicles má stejný tvar jako /api/vehicles v Node serveru.
+//! Sloučení zdrojů poloh. Port z webu: lib/fusion.mjs, lib/hub.mjs a normalize() z lib/feed.mjs.
+//! Výstup /api/vehicles má stejný tvar jako /api/vehicles v Node serveru.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
 const SAME_SPOT_M: f64 = 150.0;
 const M_PER_DEG_LAT: f64 = 110540.0;
 const M_PER_DEG_LNG: f64 = 111320.0;
-const DPMUL_AGENCY: &str = "Dopravní podnik města Ústí nad Labem";
 
 // ---------------------------------------------------------------- model
 
-#[derive(Clone, Default, Serialize, Debug)]
+/// Serializovaný tvar je zároveň vstupní formát externích konektorů (`{"vehicles": [...]}`, např. DPMUL_URL);
+/// chybějící pole dostanou výchozí hodnotu.
+#[derive(Clone, Default, Serialize, Deserialize, Debug)]
+#[serde(default)]
 pub struct Vehicle {
     pub source: String,
     pub segment: String,
@@ -187,10 +189,6 @@ fn clean(v: Option<&Value>) -> Option<String> {
     }
 }
 
-fn js_round(x: f64) -> i64 {
-    (x + 0.5).floor() as i64
-}
-
 /// Malá písmena bez diakritiky ("Ústí" → "usti").
 pub fn fold(s: &str) -> String {
     s.chars()
@@ -228,13 +226,6 @@ pub fn norm_line(s: &str) -> String {
 
 pub fn distance_m(la1: f64, lo1: f64, la2: f64, lo2: f64) -> f64 {
     ((lo2 - lo1) * M_PER_DEG_LNG * (la1 * std::f64::consts::PI / 180.0).cos()).hypot((la2 - la1) * M_PER_DEG_LAT)
-}
-
-fn bearing(la1: f64, lo1: f64, la2: f64, lo2: f64) -> f64 {
-    let (f1, f2, dl) = (la1.to_radians(), la2.to_radians(), (lo2 - lo1).to_radians());
-    let y = dl.sin() * f2.cos();
-    let x = f1.cos() * f2.sin() - f1.sin() * f2.cos() * dl.cos();
-    (y.atan2(x).to_degrees() + 360.0) % 360.0
 }
 
 // ---------------------------------------------------------------- čas (Europe/Prague bez knihoven)
@@ -414,121 +405,6 @@ pub fn duk_vehicle(e: &Value, age_sec: i64) -> Option<Vehicle> {
         city,
         ..Default::default()
     })
-}
-
-// ---------------------------------------------------------------- DPMÚL
-
-pub fn parse_delay_minutes(v: Option<&Value>) -> i64 {
-    let s = match v {
-        None | Some(Value::Null) => String::new(),
-        Some(x) => js_string(x),
-    };
-    let s = s.trim();
-    if s.is_empty() {
-        return 0;
-    }
-    let (neg, body) = match s.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, s),
-    };
-    let p: Vec<&str> = body.split(':').collect();
-    let all_digits = |x: &str| !x.is_empty() && x.bytes().all(|c| c.is_ascii_digit());
-    if p.len() == 3 && (1..=2).contains(&p[0].len()) && p[1].len() == 2 && p[2].len() == 2 && p.iter().all(|x| all_digits(x)) {
-        let total = p[0].parse::<i64>().unwrap_or(0) * 3600 + p[1].parse::<i64>().unwrap_or(0) * 60 + p[2].parse::<i64>().unwrap_or(0);
-        return js_round((if neg { -total } else { total }) as f64 / 60.0);
-    }
-    // parseFloat: nejdelší číselný prefix
-    let t = s.replace(',', ".");
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'-' || b[i] == b'+') {
-        i += 1;
-    }
-    let ds = i;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i < b.len() && b[i] == b'.' {
-        i += 1;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-    }
-    match t[..i].parse::<f64>() {
-        Ok(n) if i > ds && n.is_finite() => js_round(n),
-        _ => 0,
-    }
-}
-
-/// Odpověď DPMÚL (pole objektů) → vozidla. `stations` = naučené polohy stanic (stationNumber → (lat, lng)).
-pub fn parse_dpmul(arr: &[Value], now_ms: i64, stations: &mut HashMap<i64, (f64, f64)>) -> Vec<Vehicle> {
-    let mut out = Vec::new();
-    for o in arr {
-        let (lat_v, lng_v) = (o.get("latitude"), o.get("longitude"));
-        if matches!(lat_v, None | Some(Value::Null)) || matches!(lng_v, None | Some(Value::Null)) {
-            continue;
-        }
-        let (lat, lng) = (js_number(lat_v), js_number(lng_v));
-        if !(lat >= 48.0 && lat <= 52.0 && lng >= 12.0 && lng <= 19.0) {
-            continue;
-        }
-        let mut observed = if js_truthy(o.get("lastActivity")) { o.get("lastActivity").and_then(|v| parse_time_ms(&js_string(v))) } else { None };
-        if observed.is_none() {
-            observed = o.get("gpsTimestamp").and_then(|v| parse_time_ms(&js_string(v)));
-        }
-        if let Some(ob) = observed {
-            if now_ms - ob > 10 * 60_000 {
-                continue;
-            }
-        }
-        let station = num_or0(o.get("stationNumber")) as i64;
-        let at_stop = js_truthy(o.get("arrivedAt")) || js_truthy(o.get("stoppedAt"));
-        let mut heading = None;
-        if at_stop {
-            if station != 0 {
-                stations.insert(station, (lat, lng));
-            }
-        } else if let Some(&(slat, slng)) = stations.get(&station) {
-            if station != 0 && distance_m(lat, lng, slat, slng) > 30.0 {
-                if js_truthy(o.get("inTransitTo")) || js_truthy(o.get("incomingAt")) {
-                    heading = Some(bearing(lat, lng, slat, slng));
-                } else if js_truthy(o.get("leftAt")) {
-                    heading = Some(bearing(slat, slng, lat, lng));
-                }
-            }
-        }
-        let mut line = match o.get("lineName") {
-            None | Some(Value::Null) => "?".to_string(),
-            Some(x) => js_string(x).trim().to_string(),
-        };
-        if line.is_empty() {
-            line = "?".into();
-        }
-        if line == "200" {
-            line = "X".into();
-        }
-        out.push(Vehicle {
-            source: "dpmul".into(),
-            segment: "city".into(),
-            id: num_or0(o.get("vehicleNumber")) as i64,
-            lat,
-            lng,
-            line,
-            delay: parse_delay_minutes(o.get("delay")),
-            age_sec: observed.map_or(0, |ob| ((now_ms - ob) / 1000).max(0)),
-            state: 0,
-            train: false,
-            agency: DPMUL_AGENCY.into(),
-            low: opt_bool(o.get("isWheelchairAccessible")),
-            ac: opt_bool(o.get("isAirConditioned")),
-            heading,
-            city: true,
-            station,
-            final_station: num_or0(o.get("finalStationNumber")) as i64,
-            ..Default::default()
-        });
-    }
-    out
 }
 
 // ---------------------------------------------------------------- slučování (fusion.mjs)
@@ -1055,32 +931,10 @@ mod tests {
     }
 
     #[test]
-    fn delay_and_time() {
-        assert_eq!(parse_delay_minutes(Some(&json!("00:05:00"))), 5);
-        assert_eq!(parse_delay_minutes(Some(&json!("-00:01:30"))), -1);
-        assert_eq!(parse_delay_minutes(Some(&json!("3,4"))), 3);
-        assert_eq!(parse_delay_minutes(None), 0);
+    fn time_parsing() {
         assert_eq!(parse_time_ms("2026-07-01T12:00:00"), parse_time_ms("2026-07-01T10:00:00Z"));
         assert_eq!(parse_time_ms("2026-11-10T22:00:00"), parse_time_ms("2026-11-10T21:00:00Z"));
         assert_eq!(parse_time_ms("2026-11-10T21:59:50+01:00"), parse_time_ms("2026-11-10T20:59:50Z"));
-    }
-
-    #[test]
-    fn dpmul_parsing() {
-        let now = parse_time_ms("2026-11-10T21:00:00Z").unwrap();
-        let body = vec![
-            json!({"vehicleNumber": 451, "lineName": "81", "delay": "00:05:00", "latitude": 50.66, "longitude": 14.04, "lastActivity": "2026-11-10T21:59:50+01:00", "isWheelchairAccessible": true, "isAirConditioned": false}),
-            json!({"vehicleNumber": 2, "lineName": "200", "latitude": 50.67, "longitude": 14.05, "gpsTimestamp": "2026-11-10T22:00:00"}),
-            json!({"vehicleNumber": 3, "lineName": "1", "latitude": null, "longitude": null}),
-            json!({"vehicleNumber": 4, "lineName": "2", "latitude": 10, "longitude": 10}),
-        ];
-        let v = parse_dpmul(&body, now, &mut HashMap::new());
-        assert_eq!(v.iter().map(|x| x.id).collect::<Vec<_>>(), vec![451, 2]);
-        assert_eq!(v[0].delay, 5);
-        assert_eq!(v[0].age_sec, 10);
-        assert_eq!(v[0].low, Some(true));
-        assert_eq!(v[0].ac, Some(false));
-        assert_eq!(v[1].line, "X");
     }
 
     #[test]

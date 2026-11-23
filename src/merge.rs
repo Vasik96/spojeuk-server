@@ -784,6 +784,18 @@ mod tests {
     }
 
     #[test]
+    fn fuse_keeps_trolleybus_mode_from_dpmul_even_when_duk_position_wins() {
+        let mut dpmul_v = veh("dpmul", 666, 50.6601, "72", 30);
+        dpmul_v.mode = "trolleybus".into();
+        let dpmul = inp("dpmul", &["city"], "live", 90, vec![dpmul_v]);
+        let duk = inp("duk", &["city", "regional"], "live", 40, vec![veh("duk", 300666, 50.66, "72", 2)]);
+        let out = fuse(&[dpmul, duk]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source, "duk");
+        assert_eq!(out[0].mode, "trolleybus");
+    }
+
+    #[test]
     fn fuse_ghost_removed_when_other_source_live() {
         let dpmul = inp("dpmul", &["city"], "live", 90, vec![veh("dpmul", 500, 50.6, "81", 1)]);
         let duk = inp("duk", &["city", "regional"], "live", 40, vec![veh("duk", 300777, 50.65, "81", 200)]);

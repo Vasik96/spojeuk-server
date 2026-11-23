@@ -6,8 +6,10 @@
 //!
 //! DPMÚL (MHD Ústí nad Labem): volitelný externí konektor. Zapíná se proměnnou DPMUL_URL (bez ní se kanál
 //! nedotazuje); ta ukazuje na samostatný adaptér, který vrací už hotový formát {"vehicles": [...]} (tvar
-//! merge::Vehicle). Volitelný DPMUL_API_KEY se posílá jako `Authorization: Bearer`. Vozidla jdou do /api/vehicles;
-//! volitelné pole "traffic" (původní odpověď) se beze změny vrací na /dpmul/traffic a /api/raw/dpmul.
+//! merge::Vehicle). Server rozumí i přímo surové odpovědi dopravce (pole s vehicleNumber / transportType, viz dpmul.rs):
+//! transportType "O" = trolejbus, "T" = autobus (pole `mode` ve výstupu). Volitelný DPMUL_API_KEY se posílá jako
+//! `Authorization: Bearer`. Vozidla jdou do /api/vehicles; volitelné pole "traffic" (původní odpověď; u surového
+//! tvaru samotné pole vozidel) se vrací na /dpmul/traffic a /api/raw/dpmul.
 //! Vypnutý nebo neodpovídající konektor = oba vrací [].
 //!
 //! SŽ (Správa železnic): vlaky z mapy SŽ (bez User-Agent, min. 10 s mezi dotazy, 403 = dlouhá pauza).
@@ -42,6 +44,7 @@
 
 mod dpkv;
 mod dpmd;
+mod dpmul;
 mod pmdp;
 mod idol;
 mod inflate;
@@ -569,27 +572,38 @@ struct VehicleFeed {
     traffic: Option<Box<serde_json::value::RawValue>>,
 }
 
+/// Tělo odpovědi → (vozidla, payload pro /dpmul/traffic). Surová odpověď dopravce (vehicleNumber / transportType)
+/// se převede tady, jinak se čte hotový tvar {"vehicles": [...]} z adaptéru.
+fn dpmul_decode(body: &[u8], now_ms: i64) -> Result<(Vec<Vehicle>, Arc<[u8]>), String> {
+    let root: Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+    if let Some(list) = dpmul::raw_list(&root) {
+        let payload = serde_json::to_vec(list).map_err(|e| e.to_string())?;
+        return Ok((dpmul::parse_raw(list, now_ms), Arc::from(payload)));
+    }
+    let mut feed = serde_json::from_slice::<VehicleFeed>(body).map_err(|e| e.to_string())?;
+    let traffic: Arc<[u8]> = match &feed.traffic {
+        Some(r) if r.get().trim_start().starts_with('[') => Arc::from(r.get().as_bytes()),
+        _ => Arc::from(&b"[]"[..]),
+    };
+    Ok((std::mem::take(&mut feed.vehicles), traffic))
+}
+
 fn dpmul_poller(sh: Arc<Shared>) {
     let cfg = sh.cfg;
     // Agent drží pool spojení (keep-alive), DNS a TLS se neplatí při každém dotazu
     let agent = make_agent(Duration::from_secs_f64(cfg.dpmul_timeout_s), 0);
     while !sh.stop.is_set() {
         let t0 = now();
-        let res = dpmul_fetch(&agent, cfg)
-            .and_then(|body| serde_json::from_slice::<VehicleFeed>(&body).map_err(|e| e.to_string()));
+        let res = dpmul_fetch(&agent, cfg).and_then(|body| dpmul_decode(&body, (now() * 1000.0) as i64));
         match res {
-            Ok(mut feed) => {
+            Ok((vehicles, traffic)) => {
                 let t = now();
                 // zdroj a segment určuje tento server, ne konektor (na nich stojí slučování a uid)
-                let list: Vec<Vehicle> = std::mem::take(&mut feed.vehicles)
+                let list: Vec<Vehicle> = vehicles
                     .into_iter()
                     .filter(|v| v.lat.is_finite() && v.lng.is_finite() && v.lat != 0.0 && v.lng != 0.0)
                     .map(|v| Vehicle { source: "dpmul".into(), segment: "city".into(), city: true, age_sec: v.age_sec.max(0), ..v })
                     .collect();
-                let traffic: Arc<[u8]> = match &feed.traffic {
-                    Some(r) if r.get().trim_start().starts_with('[') => Arc::from(r.get().as_bytes()),
-                    _ => Arc::from(&b"[]"[..]),
-                };
                 let mut g = lock(&sh.dpmul);
                 g.payload = traffic;
                 g.vehicles = list.len();

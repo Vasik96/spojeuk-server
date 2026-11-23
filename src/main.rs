@@ -55,7 +55,7 @@ mod ratelimit;
 mod sz;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{Cursor, Read},
     path::PathBuf,
@@ -95,6 +95,8 @@ struct Config {
     dpmul_poll_s: f64,
     dpmul_timeout_s: f64,
     dpmul_hold_s: f64,
+    /// Čísla vánočních vozů DPMÚL z CHRISTMAS_VEHICLES.
+    christmas_vehicles: HashSet<i64>,
     sz_enabled: bool,
     sz_url: String,
     sz_poll_s: f64,
@@ -140,6 +142,20 @@ fn env_f(k: &str, d: f64) -> f64 {
     env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d)
 }
 
+fn parse_vehicle_ids(value: &str) -> HashSet<i64> {
+    value
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match s.parse::<i64>() {
+            Ok(id) if id > 0 => Some(id),
+            _ => {
+                warn!("CHRISTMAS_VEHICLES: ignoruji neplatné číslo '{}'", s);
+                None
+            }
+        })
+        .collect()
+}
+
 /// Obdélník z prostředí "lat_min,lng_min,lat_max,lng_max"; nenastaveno = výchozí, "off" / "0" / prázdné = bez omezení.
 fn env_box(k: &str, d: Bbox) -> Option<Bbox> {
     let Ok(v) = env::var(k) else { return Some(d) };
@@ -160,6 +176,7 @@ fn is_loopback_bind(b: &str) -> bool {
 impl Config {
     fn from_env() -> Self {
         let bind = env_str("BIND", "127.0.0.1");
+        let christmas_vehicles = parse_vehicle_ids(&env_str("CHRISTMAS_VEHICLES", ""));
         Config {
             upstream: env_str("UPSTREAM_URL", "https://tabule.portabo.cz/api/v1-tabule/cis/GetTraffic/0"),
             poll_s: env_f("POLL_S", 10.0),
@@ -175,6 +192,7 @@ impl Config {
             dpmul_poll_s: env_f("DPMUL_POLL_S", 5.0),
             dpmul_timeout_s: env_f("DPMUL_TIMEOUT_S", 30.0),
             dpmul_hold_s: env_f("DPMUL_HOLD_S", 120.0),
+            christmas_vehicles,
             sz_enabled: env_str("SZ", "1") != "0",
             sz_url: env_str(
                 "SZ_URL",
@@ -1286,7 +1304,14 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
         let g = lock(&sh.dpmul);
         let held_s = (t - g.list_ts).floor() as i64;
         let vehicles: Vec<Vehicle> = if g.list_ts > 0.0 && held_s <= 60 {
-            g.list.iter().map(|v| Vehicle { age_sec: v.age_sec + held_s, ..v.clone() }).collect()
+            g.list
+                .iter()
+                .map(|v| {
+                    let mut v = Vehicle { age_sec: v.age_sec + held_s, ..v.clone() };
+                    v.christmas = merge::is_configured_dpmul_vehicle(&v, &cfg.christmas_vehicles);
+                    v
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -1410,7 +1435,8 @@ fn build_vehicles(sh: &Shared) -> Arc<[u8]> {
             if since > cfg.poll_s * 1.5 {
                 held += 1;
             }
-            if let Some(v) = merge::duk_vehicle(&it.e, it.gps + since.floor().max(0.0) as i64) {
+            if let Some(mut v) = merge::duk_vehicle(&it.e, it.gps + since.floor().max(0.0) as i64) {
+                v.christmas = merge::is_configured_dpmul_vehicle(&v, &cfg.christmas_vehicles);
                 vehicles.push(v);
             }
         }
@@ -1918,4 +1944,15 @@ fn main() {
         let _ = w.join();
     }
     save(&sh);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_vehicle_ids;
+
+    #[test]
+    fn parses_christmas_vehicle_ids() {
+        assert_eq!(parse_vehicle_ids("424, 624;68"), [68, 424, 624].into_iter().collect());
+        assert!(parse_vehicle_ids("").is_empty());
+    }
 }

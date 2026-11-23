@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const SAME_SPOT_M: f64 = 150.0;
 const M_PER_DEG_LAT: f64 = 110540.0;
@@ -45,6 +45,9 @@ pub struct Vehicle {
     /// Druh dopravy pro appku (barva na mapě): bus | tram | metro | trolleybus | train | ferry | funicular.
     /// PID ho zná z GTFS route_type, ostatní zdroje dostanou bus / train v [fuse].
     pub mode: String,
+    /// Jen vánočně vyzdobené vozy; běžným vozům se pole ve výstupu vynechá.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub christmas: bool,
     /// PID: klíč vozidla "<route_type>:<číslo vozu>" / "train:<číslo vlaku>" / "trip:<gtfs spoj>" (nejde do výstupu)
     #[serde(skip)]
     pub vkey: String,
@@ -426,6 +429,13 @@ pub fn base_vehicle_id(id: i64) -> i64 {
     id
 }
 
+/// Zda vozidlo pochází z DPMÚL (nebo jeho ID z DÚK) a je uvedené v CHRISTMAS_VEHICLES.
+pub fn is_configured_dpmul_vehicle(v: &Vehicle, ids: &HashSet<i64>) -> bool {
+    let dpmul_id = v.source == "dpmul"
+        || (v.source == "duk" && v.city && v.id >= 300_000 && v.id.to_string().starts_with("30"));
+    dpmul_id && ids.contains(&base_vehicle_id(v.id))
+}
+
 pub fn same_vehicle_id(a: i64, b: i64) -> bool {
     a > 0 && b > 0 && (a == b || base_vehicle_id(a) == base_vehicle_id(b))
 }
@@ -524,6 +534,7 @@ fn resolve(group: Vec<Vehicle>) -> Vehicle {
     w.heading = heading;
     w.station = station;
     w.final_station = final_station;
+    w.christmas = group.iter().any(|v| v.christmas);
     w.sources = sources;
     w.ids = ids;
     // PID autobus sloučený s DÚK: uid dává ten druhý zdroj, aby se nezměnilo podle toho, kdo zrovna vyhrál
@@ -957,5 +968,26 @@ mod tests {
         let t = duk_vehicle(&json!({"ID": 21234, "Latitude": 50.6, "Longitude": 14.0, "State": 0, "RouteID": " 1193 "}), 0).unwrap();
         assert!(t.train && t.cis == "1193" && t.trip.is_empty() && t.segment == "regional");
         assert!(duk_vehicle(&json!({"ID": 1, "Latitude": 50.6, "Longitude": 14.0, "State": 255}), 0).is_none());
+    }
+
+    #[test]
+    fn configured_christmas_vehicles_are_marked_and_survive_fusion() {
+        let ids = [424, 624].into_iter().collect();
+        let mut dpmul = veh("dpmul", 424, 50.66, "84", 5);
+        assert!(is_configured_dpmul_vehicle(&dpmul, &ids));
+        dpmul.christmas = true;
+        let mut duk = veh("duk", 300424, 50.66, "84", 1);
+        duk.city = true;
+        assert!(is_configured_dpmul_vehicle(&duk, &ids));
+
+        let out = fuse(&[inp("dpmul", &["city"], "live", 60, vec![dpmul]), inp("duk", &["city"], "live", 60, vec![duk])]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].christmas);
+        assert!(serde_json::to_value(&out[0]).unwrap()["christmas"].as_bool().unwrap());
+
+        let ordinary = veh("dpmd", 424, 50.66, "84", 1);
+        let ordinary_json = serde_json::to_value(&ordinary).unwrap();
+        assert!(ordinary_json.get("christmas").is_none());
+        assert!(!is_configured_dpmul_vehicle(&ordinary, &ids));
     }
 }

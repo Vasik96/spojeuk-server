@@ -76,9 +76,13 @@ pub fn parse_raw(list: &[Value], now_ms: i64) -> Vec<Vehicle> {
             o.get(k).and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))).unwrap_or(0)
         };
         let (Some(lat), Some(lng)) = (o.get("latitude").and_then(|v| v.as_f64()), o.get("longitude").and_then(|v| v.as_f64())) else { continue };
-        let line = s("lineName");
+        let mut line = s("lineName");
         if line.is_empty() || lat == 0.0 || lng == 0.0 {
             continue;
+        }
+        // stejné pravidlo jako u DÚK (merge::duk_vehicle): linka 200 je interní označení, ve výstupu je "X"
+        if line == "200" {
+            line = "X".into();
         }
         let fix = parse_time_ms(&s("gpsTimestamp")).or_else(|| parse_time_ms(&s("lastActivity")));
         let age_sec = fix.map_or(0, |t| ((now_ms - t) / 1000).max(0));
@@ -153,6 +157,17 @@ mod tests {
         assert_eq!((b.id, b.mode.as_str(), b.heading, b.delay, b.ac), (669, "trolleybus", Some(170.8), 0, Some(false)));
         assert_eq!((vs[2].mode.as_str(), vs[2].delay), ("bus", -2));
         assert_eq!((vs[3].mode.as_str(), vs[3].delay), ("", 5), "neznámý typ nesmí být trolejbus; 4:40 = 5 min");
+    }
+
+    #[test]
+    fn line_200_is_x() {
+        let root: Value = serde_json::from_str(
+            r#"[{"vehicleNumber":5,"lineName":"200","transportType":"T","latitude":50.6,"longitude":14.0,"gpsTimestamp":"2026-11-23T12:22:20"},
+                {"vehicleNumber":6,"lineName":"20","transportType":"T","latitude":50.6,"longitude":14.0,"gpsTimestamp":"2026-11-23T12:22:20"}]"#,
+        )
+        .unwrap();
+        let vs = parse_raw(raw_list(&root).unwrap(), now_ms());
+        assert_eq!((vs[0].line.as_str(), vs[1].line.as_str()), ("X", "20"));
     }
 
     #[test]
